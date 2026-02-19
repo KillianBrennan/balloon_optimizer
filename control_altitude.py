@@ -100,7 +100,7 @@ def compute_terminal_velocity(altitude, balloon_volume, gross_mass):
     force_sign = np.sign(total_force)
     total_force = np.abs(total_force)
 
-    baloon_radius = (3 * balloon_volume / (4 * np.pi)) ** (1 / 3)
+    baloon_radius = (3 * BALLOON_VOLUME_INITIAL / (4 * np.pi)) ** (1 / 3) # Approximate radius based on initial volume (cross-section stays constant)
     cross_sectional_area = np.pi * baloon_radius**2
     terminal_velocity = np.sqrt(
         2
