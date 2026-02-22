@@ -5,7 +5,7 @@ import numpy as np
 
 LAT = 51.963517
 LON = 7.615650
-P = 900
+P = 1000
 TIMES = [-2,0,2]      # times in hours; caltra expects hh.mm but uses only minutes internally
 LAT_STEP = 0.15
 LON_STEP = LAT_STEP / np.cos(np.deg2rad(LAT))
