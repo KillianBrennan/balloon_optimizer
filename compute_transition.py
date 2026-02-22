@@ -16,6 +16,18 @@ DEFAULT_END = "20240917_20"
 DATA_ROOT = "/home/kbrennan/data/era5/cdf"
 OUTPUT_DIR = "/home/kbrennan/data/balloon/transition_matrices"
 
+# Horizontal domain and vertical level range as in test_transition.ipynb
+# Base domain box (lon_min, lon_max, lat_min, lat_max)
+DOMAIN = (-25.0, 35.0, 33.0, 72.0)
+LON_MIN = DOMAIN[0]
+LON_MAX = DOMAIN[1]
+LAT_MIN = DOMAIN[2]
+LAT_MAX = DOMAIN[3]
+
+# Pressure level limits in Pa (500–900 hPa)
+PLEV_MIN = 50_000.0
+PLEV_MAX = 90_000.0
+
 
 def main(
     start: str = DEFAULT_START,
@@ -55,8 +67,14 @@ def main(
             continue
 
         zfile = xr.open_dataset(zpath)
-        # only keep U and V for the transition computation
-        zfile_uv = zfile[["U", "V"]]
+        # Only keep U and V for the transition computation and
+        # restrict to the same domain and pressure levels used in
+        # test_transition.ipynb
+        zfile_uv = zfile[["U", "V"]].sel(
+            lon=slice(LON_MIN, LON_MAX),
+            lat=slice(LAT_MIN, LAT_MAX),
+            plev=slice(PLEV_MIN, PLEV_MAX),
+        )
 
         transition_ds = compute_transition_indices(zfile_uv, dt=dt)
         datasets.append(transition_ds)
