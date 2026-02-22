@@ -1,16 +1,86 @@
 '''
-computes transition indices
+computes transition indices and writes transition matrices to NetCDF
 '''
+
+import os
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 import numpy as np
 import xarray as xr
+from tqdm import tqdm
 
-def main():
-    '''
-    '''
-    return
+DEFAULT_DT = 2 * 3600.0  # default timestep in seconds (2 hours)
+DEFAULT_START = "20240914_20"
+DEFAULT_END = "20240917_20"
+DATA_ROOT = "/home/kbrennan/data/era5/cdf"
+OUTPUT_DIR = "/home/kbrennan/data/balloon/transition_matrices"
 
-def compute_transition_indices(zfile: xr.Dataset, dt: float = 3600.0) -> np.ndarray:
+
+def main(
+    start: str = DEFAULT_START,
+    end: str = DEFAULT_END,
+    dt: float = DEFAULT_DT,
+) -> None:
+    """Compute transition matrices for all Z files in a given time range.
+
+    Parameters
+    ----------
+    start : str, optional
+        Start date/time in the format ``YYYYMMDD_HH`` (inclusive).
+    end : str, optional
+        End date/time in the format ``YYYYMMDD_HH`` (inclusive).
+    dt : float, optional
+        Advection time step in seconds. Defaults to 2 hours.
+    """
+
+    t_start = datetime.strptime(start, "%Y%m%d_%H")
+    t_end = datetime.strptime(end, "%Y%m%d_%H")
+
+    datasets: List[xr.Dataset] = []
+
+    # Number of hourly steps between start and end (inclusive)
+    nsteps = int((t_end - t_start).total_seconds() // 3600) + 1
+
+    for istep in tqdm(range(nsteps), desc="Computing transition matrices"):
+        current = t_start + timedelta(hours=istep)
+
+        date_code = current.strftime("%Y%m%d_%H")
+        year = current.strftime("%Y")
+        month = current.strftime("%m")
+        zpath = os.path.join(DATA_ROOT, year, month, f"Z{date_code}")
+
+        if not os.path.exists(zpath):
+            # Skip missing files rather than aborting the whole range
+            continue
+
+        zfile = xr.open_dataset(zpath)
+        # only keep U and V for the transition computation
+        zfile_uv = zfile[["U", "V"]]
+
+        transition_ds = compute_transition_indices(zfile_uv, dt=dt)
+        datasets.append(transition_ds)
+
+    if not datasets:
+        return
+
+    # Concatenate along time dimension. This assumes each input file has a
+    # single time step and consistent grid/levels.
+    combined = xr.concat(datasets, dim="time")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    outfile = os.path.join(
+        OUTPUT_DIR,
+        f"transition_indices_{start}_{end}_dt{int(dt)}.nc",
+    )
+    combined.to_netcdf(outfile)
+
+
+def compute_transition_indices(
+    zfile: xr.Dataset,
+    dt: float = 3600.0,
+    outfile: Optional[str] = None,
+) -> xr.Dataset:
     """Compute destination grid indices for one advection time step.
 
     For each horizontal grid point, compute the (lat, lon) index where a parcel
@@ -30,13 +100,15 @@ def compute_transition_indices(zfile: xr.Dataset, dt: float = 3600.0) -> np.ndar
     dt : float, optional
         Time step in seconds over which to advect the flow. Defaults to 3600 s
         (one hour).
+    outfile : str, optional
+        If provided, the resulting indices dataset is also written to this
+        NetCDF file via ``to_netcdf``.
 
     Returns
     -------
-    np.ndarray
-        Integer array of shape ``(2, *U.shape)`` where the first entry holds
-        the destination latitude indices and the second the destination
-        longitude indices for each grid point.
+    xr.Dataset
+        Dataset with two integer DataArrays ``lat_idx`` and ``lon_idx`` having
+        the same dimensions and coordinates as ``U`` / ``V``.
     """
 
     # Extract wind components
@@ -58,8 +130,9 @@ def compute_transition_indices(zfile: xr.Dataset, dt: float = 3600.0) -> np.ndar
 
     # Reorder so that horizontal dimensions are the last two: (..., lat, lon)
     other_dims = [d for d in u_da.dims if d not in ("lat", "lon")]
-    u = u_da.transpose(*other_dims, "lat", "lon").values
-    v = v_da.transpose(*other_dims, "lat", "lon").values
+    dims = tuple(other_dims + ["lat", "lon"])
+    u = u_da.transpose(*dims).values
+    v = v_da.transpose(*dims).values
 
     # Record original shape to reshape results later
     orig_shape = u.shape
@@ -119,10 +192,29 @@ def compute_transition_indices(zfile: xr.Dataset, dt: float = 3600.0) -> np.ndar
     lat_indices = j_new_rounded.reshape(orig_shape)
     lon_indices = i_new_rounded.reshape(orig_shape)
 
-    # Stack into a single array: (2, *orig_shape)
-    transition_indices = np.stack((lat_indices, lon_indices), axis=0)
+    # Build DataArrays with original dimensions and coordinates
+    coords = {d: u_da[d].values for d in dims if d in u_da.coords}
 
-    return transition_indices
+    lat_da = xr.DataArray(
+        lat_indices,
+        dims=dims,
+        coords=coords,
+        name="lat_idx",
+    )
+    lon_da = xr.DataArray(
+        lon_indices,
+        dims=dims,
+        coords=coords,
+        name="lon_idx",
+    )
+
+    ds = xr.Dataset({"lat_idx": lat_da, "lon_idx": lon_da})
+    ds.attrs["dt_seconds"] = float(dt)
+
+    if outfile is not None:
+        ds.to_netcdf(outfile)
+
+    return ds
 
 if __name__ == '__main__':
     main()
