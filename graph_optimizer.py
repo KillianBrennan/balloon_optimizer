@@ -23,11 +23,40 @@ from typing import Callable, Optional, Tuple, List
 
 import numpy as np
 from tqdm import tqdm
+import cartopy.io.shapereader as shpreader
+import shapely.geometry as sgeom
+from shapely.ops import unary_union
 
 
 # Type aliases
 Index3D = Tuple[int, int, int]
 Index4D = Tuple[int, int, int, int]
+
+
+def build_land_mask(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Build a land mask (True over land) from public coastline data.
+
+    Uses Natural Earth land polygons via cartopy/shapely to classify each
+    (lat, lon) grid point as land or ocean. Resolution 110m is sufficient
+    for the current North Atlantic domain and relatively fast.
+    """
+
+    shpfilename = shpreader.natural_earth(
+        resolution="110m",
+        category="physical",
+        name="land",
+    )
+    reader = shpreader.Reader(shpfilename)
+    geoms = list(reader.geometries())
+    land_geom = unary_union(geoms)
+
+    mask = np.zeros((lats.size, lons.size), dtype=bool)
+    for i, lat in enumerate(tqdm(lats, desc="Building land mask")):
+        for j, lon in enumerate(lons):
+            pt = sgeom.Point(float(lon), float(lat))
+            if land_geom.contains(pt):
+                mask[i, j] = True
+    return mask
 
 
 def default_cost_vertical(l_prev: int, l_new: int) -> float:
@@ -283,6 +312,214 @@ def optimize_point_to_point(
         costs.append(cost)
 
     # Backwards compatibility: if k_best == 1, return single path and scalars
+    if k_best == 1:
+        return True, paths[0], values[0], costs[0]
+
+    return True, paths, np.array(values), np.array(costs)
+
+
+def find_farthest_reachable(
+    next_i: np.ndarray,
+    next_j: np.ndarray,
+    origin: Tuple[int, int],
+    B: float,
+    *,
+    allowed_levels: Optional[List[int]] = None,
+    start_levels: Optional[List[int]] = None,
+    cost_vertical: Callable[[int, int], float] = default_cost_vertical,
+    land_mask: Optional[np.ndarray] = None,
+    k_best: int = 1,
+) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
+    """Find farthest reachable points from the origin under a consumable budget.
+
+    This routine runs a dynamic program similar to :func:`optimize_point_to_point`,
+    but without a fixed target. Instead, it maximizes the final Euclidean
+    distance in grid-index space from the origin. Only endpoints that satisfy
+    an optional ``land_mask`` are considered as terminal states.
+
+    Parameters
+    ----------
+    next_i, next_j : np.ndarray
+        Integer arrays of shape ``(Nt, Nz, Nx, Ny)`` giving, for each time step
+        ``k``, level ``l`` and horizontal indices ``(i, j)``, the destination
+        indices ``(next_i, next_j)`` at time ``k+1``.
+    origin : (int, int)
+        Origin grid indices ``(i0, j0)`` at time ``k=0``.
+    B : float
+        Total consumable budget.
+    allowed_levels : list of int, optional
+        Subset of vertical levels that are allowed. If ``None``, all levels are
+        allowed.
+    start_levels : list of int, optional
+        Levels at which the trajectory is allowed to start at the origin. If
+        ``None``, all ``allowed_levels`` are used.
+    cost_vertical : callable, optional
+        Function ``cost_vertical(l_prev, l_new) -> float`` returning the
+        consumable cost of moving between vertical levels.
+    land_mask : np.ndarray, optional
+        Optional boolean mask of shape ``(Nx, Ny)`` marking grid cells that are
+        acceptable as terminal endpoints (e.g. land points). If ``None``, all
+        cells are considered acceptable.
+    k_best : int, optional
+        Number of farthest endpoints (paths) to return. ``1`` (default) returns
+        only the single farthest path.
+
+    Returns
+    -------
+    reachable : bool
+        ``True`` if at least one acceptable endpoint is reachable within
+        budget, ``False`` otherwise.
+    paths : np.ndarray or list or None
+        If reachable, either a single path of shape ``(L, 4)`` when
+        ``k_best==1`` or a list of such arrays when ``k_best>1``. Each row is
+        ``[k, i, j, l]``. Otherwise ``None``.
+    best_value : float or np.ndarray or None
+        Objective value(s) (final distance from origin in index space) of the
+        selected path(s), or ``None`` if unreachable.
+    best_cost : float or np.ndarray or None
+        Total consumable cost(s) of the selected path(s), or ``None`` if
+        unreachable.
+    """
+
+    if next_i.shape != next_j.shape:
+        raise ValueError("next_i and next_j must have the same shape")
+
+    if k_best < 1:
+        raise ValueError("k_best must be at least 1")
+
+    Nt, Nz, Nx, Ny = next_i.shape
+    i0, j0 = origin
+
+    if not (0 <= i0 < Nx and 0 <= j0 < Ny):
+        raise ValueError("Origin indices out of bounds")
+
+    if land_mask is not None:
+        if land_mask.shape != (Nx, Ny):
+            raise ValueError("land_mask must have shape (Nx, Ny)")
+
+    # Vertical levels to consider
+    all_levels = list(range(Nz))
+    if allowed_levels is None:
+        levels = all_levels
+    else:
+        levels = [l for l in allowed_levels if 0 <= l < Nz]
+        if not levels:
+            raise ValueError("No valid allowed_levels within [0, Nz-1]")
+
+    # Start level subset (must be within levels)
+    if start_levels is None:
+        start_levels_eff = levels
+    else:
+        start_levels_eff = [l for l in start_levels if l in levels]
+        if not start_levels_eff:
+            raise ValueError("No valid start_levels within allowed_levels")
+
+    # Initialize DP arrays (two time layers only)
+    best_value_current = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
+    best_cost_current = np.full((Nx, Ny, Nz), np.inf, dtype=float)
+
+    for l0 in start_levels_eff:
+        best_value_current[i0, j0, l0] = 0.0
+        best_cost_current[i0, j0, l0] = 0.0
+
+    prev_i = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
+    prev_j = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
+    prev_l = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
+
+    terminal_states: List[Tuple[float, float, Index4D]] = []
+
+    k_start = 0
+    k_end = Nt - 1
+
+    for k in tqdm(range(k_start, k_end), desc="Searching farthest reachable points"):
+        best_value_next = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
+        best_cost_next = np.full((Nx, Ny, Nz), np.inf, dtype=float)
+
+        for i in range(Nx):
+            for j in range(Ny):
+                for l in levels:
+                    if not np.isfinite(best_value_current[i, j, l]):
+                        continue
+
+                    value_here = best_value_current[i, j, l]
+                    cost_here = best_cost_current[i, j, l]
+
+                    for l_new in levels:
+                        if abs(l_new - l) > 1:
+                            continue
+
+                        delta_cost = cost_vertical(l, l_new)
+                        new_cost = cost_here + delta_cost
+
+                        if new_cost > B:
+                            continue
+
+                        i2 = int(next_i[k, l_new, i, j])
+                        j2 = int(next_j[k, l_new, i, j])
+
+                        r_prev = np.hypot(i - i0, j - j0)
+                        r_new = np.hypot(i2 - i0, j2 - j0)
+                        reward = float(r_new - r_prev)
+                        new_value = value_here + reward
+
+                        old_value = best_value_next[i2, j2, l_new]
+                        old_cost = best_cost_next[i2, j2, l_new]
+
+                        if not np.isfinite(old_value) or new_value > old_value or (
+                            np.isclose(new_value, old_value) and new_cost < old_cost
+                        ):
+                            best_value_next[i2, j2, l_new] = new_value
+                            best_cost_next[i2, j2, l_new] = new_cost
+
+                            prev_i[k + 1, i2, j2, l_new] = i
+                            prev_j[k + 1, i2, j2, l_new] = j
+                            prev_l[k + 1, i2, j2, l_new] = l
+
+        best_value_current = best_value_next
+        best_cost_current = best_cost_next
+
+        k_check = k + 1
+
+        for i in range(Nx):
+            for j in range(Ny):
+                if land_mask is not None and not land_mask[i, j]:
+                    continue
+                for l in levels:
+                    val = best_value_current[i, j, l]
+                    cost = best_cost_current[i, j, l]
+                    if np.isfinite(val) and cost <= B:
+                        terminal_states.append((float(val), float(cost), (k_check, i, j, l)))
+
+    if not terminal_states:
+        return False, None, None, None
+
+    terminal_states.sort(key=lambda x: (-x[0], x[1]))
+    selected = terminal_states[:k_best]
+
+    paths: List[np.ndarray] = []
+    values: List[float] = []
+    costs: List[float] = []
+
+    for val, cost, (k_star, i_star, j_star, l_star) in selected:
+        path_steps: List[List[int]] = []
+        i_curr, j_curr, l_curr = i_star, j_star, l_star
+
+        for t in range(k_star, 0, -1):
+            path_steps.append([t, i_curr, j_curr, l_curr])
+            i_prev = prev_i[t, i_curr, j_curr, l_curr]
+            j_prev = prev_j[t, i_curr, j_curr, l_curr]
+            l_prev = prev_l[t, i_curr, j_curr, l_curr]
+            if i_prev < 0 or j_prev < 0 or l_prev < 0:
+                break
+            i_curr, j_curr, l_curr = i_prev, j_prev, l_prev
+
+        path_steps.append([0, i_curr, j_curr, l_curr])
+        path_steps.reverse()
+
+        paths.append(np.array(path_steps, dtype=int))
+        values.append(val)
+        costs.append(cost)
+
     if k_best == 1:
         return True, paths[0], values[0], costs[0]
 
