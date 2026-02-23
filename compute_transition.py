@@ -1,6 +1,6 @@
-'''
+"""
 computes transition indices and writes transition matrices to NetCDF
-'''
+"""
 
 import os
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ import numpy as np
 import xarray as xr
 from tqdm import tqdm
 
-DEFAULT_DT = 2 * 3600.0  # default timestep in seconds (2 hours)
+DEFAULT_DT = 3600.0  # default timestep in seconds (1 hours, is not tested for timesteps other than 1 hour and migth not work)
 DEFAULT_START = "20240914_20"
 DEFAULT_END = "20240917_20"
 DATA_ROOT = "/home/kbrennan/data/era5/cdf"
@@ -33,6 +33,7 @@ def main(
     start: str = DEFAULT_START,
     end: str = DEFAULT_END,
     dt: float = DEFAULT_DT,
+    superscale: int = 1,
 ) -> None:
     """Compute transition matrices for all Z files in a given time range.
 
@@ -43,7 +44,12 @@ def main(
     end : str, optional
         End date/time in the format ``YYYYMMDD_HH`` (inclusive).
     dt : float, optional
-        Advection time step in seconds. Defaults to 2 hours.
+        Advection time step in seconds. Defaults to 3600 s.
+    superscale : int, optional
+        Horizontal superscaling factor. ``1`` uses the native grid,
+        while e.g. ``2`` linearly interpolates U and V onto a grid
+        with roughly twice as many points in each horizontal
+        direction before computing transitions.
     """
 
     t_start = datetime.strptime(start, "%Y%m%d_%H")
@@ -52,7 +58,7 @@ def main(
     datasets: List[xr.Dataset] = []
 
     # Number of hourly steps between start and end (inclusive)
-    nsteps = int((t_end - t_start).total_seconds() // 3600) + 1
+    nsteps = int((t_end - t_start).total_seconds() // dt) + 1
 
     for istep in tqdm(range(nsteps), desc="Computing transition matrices"):
         current = t_start + timedelta(hours=istep)
@@ -61,6 +67,7 @@ def main(
         year = current.strftime("%Y")
         month = current.strftime("%m")
         zpath = os.path.join(DATA_ROOT, year, month, f"Z{date_code}")
+        ppath = os.path.join(DATA_ROOT, year, month, f"P{date_code}")
 
         if not os.path.exists(zpath):
             # Skip missing files rather than aborting the whole range
@@ -76,7 +83,109 @@ def main(
             plev=slice(PLEV_MIN, PLEV_MAX),
         )
 
-        transition_ds = compute_transition_indices(zfile_uv, dt=dt)
+        transition_ds = compute_transition_indices(zfile_uv, dt=dt, superscale=superscale)
+
+        # If a corresponding P-file with PS exists, use it to adjust
+        # transitions so that no trajectory can enter grid points
+        # below the surface (where p > PS). PS is stored in hPa,
+        # while plev is in Pa, so convert PS to Pa before comparing.
+        if os.path.exists(ppath):
+            pfile = xr.open_dataset(ppath)
+            try:
+                ps = pfile["PS"].sel(
+                    lon=slice(LON_MIN, LON_MAX),
+                    lat=slice(LAT_MIN, LAT_MAX),
+                )
+
+                # Interpolate PS to the (possibly superscaled) grid
+                # used by the transition dataset, then squeeze any
+                # singleton dimensions.
+                ps = ps.interp(
+                    lon=transition_ds["lon"],
+                    lat=transition_ds["lat"],
+                ).squeeze()
+
+                # Ensure ps is 2D (lat, lon)
+                if ps.ndim == 3 and "time" in ps.dims and ps.sizes.get("time", 1) == 1:
+                    ps = ps.isel(time=0)
+
+                if ps.ndim != 2:
+                    raise ValueError("Unexpected PS dimensions; expected 2D lat/lon")
+
+                plev_vals = transition_ds["plev"].values  # (Nz,)
+                # PS is in hPa in the P-files; convert to Pa
+                ps_vals_pa = ps.values * 100.0  # (nlat, nlon), on same grid as transitions
+
+                nlev = plev_vals.shape[0]
+                nlat_ps, nlon_ps = ps_vals_pa.shape
+
+                # Adjust transition indices so that any transition whose
+                # destination would land below topography instead points
+                # back to the origin cell (self-pointer). This way we do
+                # not need to store an additional validity mask.
+
+                lat_da = transition_ds["lat_idx"]
+                lon_da = transition_ds["lon_idx"]
+
+                lat_idx = lat_da.values
+                lon_idx = lon_da.values
+
+                # Ensure vertical and horizontal sizes match PS grid
+                if lat_idx.shape[-3] != nlev:
+                    raise ValueError("Mismatch between plev dimension and PS levels")
+                if lat_idx.shape[-2] != nlat_ps or lat_idx.shape[-1] != nlon_ps:
+                    raise ValueError("Mismatch between horizontal grid and PS grid")
+
+                # Mask of grid points below the surface for each level
+                # Shape: (Nz, nlat, nlon)
+                below_surface_3d = (
+                    plev_vals[:, np.newaxis, np.newaxis] > ps_vals_pa[np.newaxis, :, :]
+                )
+
+                # Work with a unified view where the first dimension is
+                # time-like (can be 1 if there is no explicit time dim).
+                if "time" in lat_da.dims:
+                    lat_idx_view = lat_idx
+                    lon_idx_view = lon_idx
+                else:
+                    lat_idx_view = lat_idx[np.newaxis, ...]
+                    lon_idx_view = lon_idx[np.newaxis, ...]
+
+                nt_view, nlev_view, nlat, nlon = lat_idx_view.shape
+
+                # Origin indices for self-pointers
+                j_grid, i_grid = np.indices((nlat, nlon))
+
+                # Redirect any transition whose destination is below the
+                # surface to point back to its origin cell.
+                for it in range(nt_view):
+                    for k in range(nlev_view):
+                        dest_j = lat_idx_view[it, k]
+                        dest_i = lon_idx_view[it, k]
+
+                        # Boolean mask of destinations that are below surface
+                        invalid = below_surface_3d[k, dest_j, dest_i]
+
+                        if not np.any(invalid):
+                            continue
+
+                        lat_idx_view[it, k][invalid] = j_grid[invalid]
+                        lon_idx_view[it, k][invalid] = i_grid[invalid]
+
+                # If there was no explicit time dimension, drop the extra axis
+                if "time" not in lat_da.dims:
+                    lat_idx = lat_idx_view[0]
+                    lon_idx = lon_idx_view[0]
+                else:
+                    lat_idx = lat_idx_view
+                    lon_idx = lon_idx_view
+
+                # Write adjusted indices back into the Dataset
+                transition_ds["lat_idx"].data = lat_idx
+                transition_ds["lon_idx"].data = lon_idx
+            finally:
+                pfile.close()
+
         datasets.append(transition_ds)
 
     if not datasets:
@@ -98,6 +207,7 @@ def compute_transition_indices(
     zfile: xr.Dataset,
     dt: float = 3600.0,
     outfile: Optional[str] = None,
+    superscale: int = 1,
 ) -> xr.Dataset:
     """Compute destination grid indices for one advection time step.
 
@@ -118,6 +228,10 @@ def compute_transition_indices(
     dt : float, optional
         Time step in seconds over which to advect the flow. Defaults to 3600 s
         (one hour).
+    superscale : int, optional
+        Horizontal superscaling factor. ``1`` uses the native grid, while
+        values >1 linearly interpolate U and V onto a finer regular lat/lon
+        grid before computing transitions.
     outfile : str, optional
         If provided, the resulting indices dataset is also written to this
         NetCDF file via ``to_netcdf``.
@@ -140,6 +254,35 @@ def compute_transition_indices(
     if "lat" not in u_da.coords or "lon" not in u_da.coords:
         raise KeyError("Wind fields must have 'lat' and 'lon' coordinates")
 
+    if superscale is None:
+        superscale = 1
+    if superscale < 1:
+        raise ValueError("superscale must be an integer >= 1")
+
+    # Optionally superscale the horizontal grid by linearly interpolating
+    # U and V onto a finer regular lat/lon grid.
+    if superscale > 1:
+        lat_orig = u_da["lat"].values
+        lon_orig = u_da["lon"].values
+
+        if lat_orig.size < 2 or lon_orig.size < 2:
+            raise ValueError(
+                "Latitude and longitude coordinates must have length >= 2 to superscale",
+            )
+
+        dlat = (lat_orig[1] - lat_orig[0]) / float(superscale)
+        dlon = (lon_orig[1] - lon_orig[0]) / float(superscale)
+
+        nlat_new = (lat_orig.size - 1) * superscale + 1
+        nlon_new = (lon_orig.size - 1) * superscale + 1
+
+        new_lat = lat_orig[0] + dlat * np.arange(nlat_new)
+        new_lon = lon_orig[0] + dlon * np.arange(nlon_new)
+
+        u_da = u_da.interp(lat=new_lat, lon=new_lon)
+        v_da = v_da.interp(lat=new_lat, lon=new_lon)
+
+    # Use (possibly superscaled) coordinates from u_da
     lat = u_da["lat"].values
     lon = u_da["lon"].values
 
@@ -228,11 +371,13 @@ def compute_transition_indices(
 
     ds = xr.Dataset({"lat_idx": lat_da, "lon_idx": lon_da})
     ds.attrs["dt_seconds"] = float(dt)
+    ds.attrs["superscale"] = int(superscale)
 
     if outfile is not None:
         ds.to_netcdf(outfile)
 
     return ds
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

@@ -67,11 +67,14 @@ def optimize_point_to_point(
     B: float,
     *,
     allowed_levels: Optional[List[int]] = None,
+    start_levels: Optional[List[int]] = None,
+    target_levels: Optional[List[int]] = None,
     cost_vertical: Callable[[int, int], float] = default_cost_vertical,
     reward_fn: Callable[[int, int, int, int, Tuple[int, int]], float] = default_reward,
     earliest_arrival: bool = True,
     fixed_arrival_time: Optional[int] = None,
-) -> Tuple[bool, Optional[np.ndarray], Optional[float], Optional[float]]:
+    k_best: int = 1,
+) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
     """Optimize trajectory from origin to target under a consumable budget.
 
     Parameters
@@ -89,6 +92,12 @@ def optimize_point_to_point(
     allowed_levels : list of int, optional
         Subset of vertical levels that are allowed. If ``None``, all levels are
         allowed.
+    start_levels : list of int, optional
+        Levels at which the trajectory is allowed to start at the origin. If
+        ``None``, all ``allowed_levels`` are used.
+    target_levels : list of int, optional
+        Levels at which arrival at the target is considered valid. If ``None``,
+        all ``allowed_levels`` are used.
     cost_vertical : callable, optional
         Function ``cost_vertical(l_prev, l_new) -> float`` returning the
         consumable cost of moving between vertical levels.
@@ -120,6 +129,11 @@ def optimize_point_to_point(
     if fixed_arrival_time is not None and earliest_arrival:
         raise ValueError("earliest_arrival and fixed_arrival_time cannot both be set")
 
+    if k_best < 1:
+        raise ValueError("k_best must be at least 1")
+    if k_best > 1 and earliest_arrival:
+        raise ValueError("Set earliest_arrival=False when requesting k_best > 1")
+
     Nt, Nz, Nx, Ny = next_i.shape
     i0, j0 = origin
     it, jt = target
@@ -138,12 +152,27 @@ def optimize_point_to_point(
         if not levels:
             raise ValueError("No valid allowed_levels within [0, Nz-1]")
 
+    # Start and target level subsets (must be within levels)
+    if start_levels is None:
+        start_levels_eff = levels
+    else:
+        start_levels_eff = [l for l in start_levels if l in levels]
+        if not start_levels_eff:
+            raise ValueError("No valid start_levels within allowed_levels")
+
+    if target_levels is None:
+        target_levels_eff = levels
+    else:
+        target_levels_eff = [l for l in target_levels if l in levels]
+        if not target_levels_eff:
+            raise ValueError("No valid target_levels within allowed_levels")
+
     # Initialize DP arrays (two time layers only)
     best_value_current = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
     best_cost_current = np.full((Nx, Ny, Nz), np.inf, dtype=float)
 
     # Initialization at k = 0
-    for l0 in levels:
+    for l0 in start_levels_eff:
         best_value_current[i0, j0, l0] = 0.0
         best_cost_current[i0, j0, l0] = 0.0
 
@@ -152,10 +181,8 @@ def optimize_point_to_point(
     prev_j = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
     prev_l = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
 
-    # Track best terminal state
-    best_overall_value = -np.inf
-    best_overall_cost = np.inf
-    best_terminal_state: Optional[Index4D] = None  # (k, i, j, l)
+    # Track all terminal states at the target for later ranking
+    terminal_states: List[Tuple[float, float, Index4D]] = []  # (value, cost, (k,i,j,l))
 
     k_start = 0
     k_end = Nt - 1  # last usable k for transitions is Nt-2
@@ -217,41 +244,46 @@ def optimize_point_to_point(
         if fixed_arrival_time is not None and k_check != fixed_arrival_time:
             continue
 
-        for l in levels:
+        for l in target_levels_eff:
             val = best_value_current[it, jt, l]
             cost = best_cost_current[it, jt, l]
             if np.isfinite(val):
-                if val > best_overall_value or (
-                    np.isclose(val, best_overall_value) and cost < best_overall_cost
-                ):
-                    best_overall_value = val
-                    best_overall_cost = cost
-                    best_terminal_state = (k_check, it, jt, l)
-
-        if earliest_arrival and best_terminal_state is not None:
-            break
+                terminal_states.append((float(val), float(cost), (k_check, it, jt, l)))
 
     # Infeasible if target never reached
-    if best_terminal_state is None:
+    if not terminal_states:
         return False, None, None, None
 
-    # Reconstruct path
-    k_star, i_star, j_star, l_star = best_terminal_state
-    path: List[List[int]] = []
-    i_curr, j_curr, l_curr = i_star, j_star, l_star
+    # Sort terminal states by (value desc, cost asc) and keep top-k
+    terminal_states.sort(key=lambda x: (-x[0], x[1]))
+    selected = terminal_states[:k_best]
 
-    for t in range(k_star, 0, -1):
-        path.append([t, i_curr, j_curr, l_curr])
-        i_prev = prev_i[t, i_curr, j_curr, l_curr]
-        j_prev = prev_j[t, i_curr, j_curr, l_curr]
-        l_prev = prev_l[t, i_curr, j_curr, l_curr]
-        if i_prev < 0 or j_prev < 0 or l_prev < 0:
-            # Should not happen for a consistent DP table, but guard anyway
-            break
-        i_curr, j_curr, l_curr = i_prev, j_prev, l_prev
+    paths: List[np.ndarray] = []
+    values: List[float] = []
+    costs: List[float] = []
 
-    # Add initial state at t = 0
-    path.append([0, i_curr, j_curr, l_curr])
-    path.reverse()
+    for val, cost, (k_star, i_star, j_star, l_star) in selected:
+        path_steps: List[List[int]] = []
+        i_curr, j_curr, l_curr = i_star, j_star, l_star
 
-    return True, np.array(path, dtype=int), float(best_overall_value), float(best_overall_cost)
+        for t in range(k_star, 0, -1):
+            path_steps.append([t, i_curr, j_curr, l_curr])
+            i_prev = prev_i[t, i_curr, j_curr, l_curr]
+            j_prev = prev_j[t, i_curr, j_curr, l_curr]
+            l_prev = prev_l[t, i_curr, j_curr, l_curr]
+            if i_prev < 0 or j_prev < 0 or l_prev < 0:
+                break
+            i_curr, j_curr, l_curr = i_prev, j_prev, l_prev
+
+        path_steps.append([0, i_curr, j_curr, l_curr])
+        path_steps.reverse()
+
+        paths.append(np.array(path_steps, dtype=int))
+        values.append(val)
+        costs.append(cost)
+
+    # Backwards compatibility: if k_best == 1, return single path and scalars
+    if k_best == 1:
+        return True, paths[0], values[0], costs[0]
+
+    return True, paths, np.array(values), np.array(costs)
