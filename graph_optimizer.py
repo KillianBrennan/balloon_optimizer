@@ -26,6 +26,8 @@ from tqdm import tqdm
 import cartopy.io.shapereader as shpreader
 import shapely.geometry as sgeom
 from shapely.ops import unary_union
+from shapely.prepared import prep
+from pyproj import Geod
 
 
 # Type aliases
@@ -50,13 +52,26 @@ def build_land_mask(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     geoms = list(reader.geometries())
     land_geom = unary_union(geoms)
 
-    mask = np.zeros((lats.size, lons.size), dtype=bool)
-    for i, lat in enumerate(tqdm(lats, desc="Building land mask")):
-        for j, lon in enumerate(lons):
-            pt = sgeom.Point(float(lon), float(lat))
-            if land_geom.contains(pt):
-                mask[i, j] = True
-    return mask
+    lats = np.asarray(lats)
+    lons = np.asarray(lons)
+
+    # Fast path: use shapely.vectorized if available
+    try:
+        from shapely import vectorized  # type: ignore
+
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+        mask = vectorized.contains(land_geom, lon_grid, lat_grid)
+        return mask
+    except Exception:
+        # Fallback: use prepared geometry with an explicit loop
+        land_prep = prep(land_geom)
+        mask = np.zeros((lats.size, lons.size), dtype=bool)
+        for i, lat in enumerate(tqdm(lats, desc="Building land mask (fallback)")):
+            for j, lon in enumerate(lons):
+                pt = sgeom.Point(float(lon), float(lat))
+                if land_prep.contains(pt):
+                    mask[i, j] = True
+        return mask
 
 
 def default_cost_vertical(l_prev: int, l_new: int) -> float:
@@ -326,8 +341,11 @@ def find_farthest_reachable(
     *,
     allowed_levels: Optional[List[int]] = None,
     start_levels: Optional[List[int]] = None,
+    target_levels: Optional[List[int]] = None,
     cost_vertical: Callable[[int, int], float] = default_cost_vertical,
     land_mask: Optional[np.ndarray] = None,
+    lats: Optional[np.ndarray] = None,
+    lons: Optional[np.ndarray] = None,
     k_best: int = 1,
 ) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
     """Find farthest reachable points from the origin under a consumable budget.
@@ -356,6 +374,15 @@ def find_farthest_reachable(
     cost_vertical : callable, optional
         Function ``cost_vertical(l_prev, l_new) -> float`` returning the
         consumable cost of moving between vertical levels.
+    target_levels : list of int, optional
+        Levels at which endpoints are considered valid. If ``None``, all
+        ``allowed_levels`` are used.
+    lats, lons : np.ndarray, optional
+        One-dimensional latitude and longitude coordinates of shape ``(Nx,)``
+        and ``(Ny,)`` used to compute geodesic distances from the origin. If
+        provided, the optimization objective is the final great-circle
+        distance from the origin in physical space. Both must be provided
+        together.
     land_mask : np.ndarray, optional
         Optional boolean mask of shape ``(Nx, Ny)`` marking grid cells that are
         acceptable as terminal endpoints (e.g. land points). If ``None``, all
@@ -379,6 +406,10 @@ def find_farthest_reachable(
     best_cost : float or np.ndarray or None
         Total consumable cost(s) of the selected path(s), or ``None`` if
         unreachable.
+    reachable_mask : np.ndarray or None
+        Boolean array of shape ``(Nx, Ny)`` where ``True`` marks gridpoints
+        that are reachable within budget at some time on any of the
+        ``target_levels``. ``None`` if no state is reachable.
     """
 
     if next_i.shape != next_j.shape:
@@ -397,6 +428,13 @@ def find_farthest_reachable(
         if land_mask.shape != (Nx, Ny):
             raise ValueError("land_mask must have shape (Nx, Ny)")
 
+    if (lats is None) != (lons is None):
+        raise ValueError("Both lats and lons must be provided together or both None")
+
+    if lats is not None:
+        if lats.shape[0] != Nx or lons.shape[0] != Ny:
+            raise ValueError("lats and lons must have shapes (Nx,) and (Ny,)")
+
     # Vertical levels to consider
     all_levels = list(range(Nz))
     if allowed_levels is None:
@@ -414,6 +452,14 @@ def find_farthest_reachable(
         if not start_levels_eff:
             raise ValueError("No valid start_levels within allowed_levels")
 
+    # Target level subset (must be within levels)
+    if target_levels is None:
+        target_levels_eff = levels
+    else:
+        target_levels_eff = [l for l in target_levels if l in levels]
+        if not target_levels_eff:
+            raise ValueError("No valid target_levels within allowed_levels")
+
     # Initialize DP arrays (two time layers only)
     best_value_current = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
     best_cost_current = np.full((Nx, Ny, Nz), np.inf, dtype=float)
@@ -421,6 +467,10 @@ def find_farthest_reachable(
     for l0 in start_levels_eff:
         best_value_current[i0, j0, l0] = 0.0
         best_cost_current[i0, j0, l0] = 0.0
+
+    # Track all reachable horizontal gridpoints (any time, target levels only)
+    reachable_mask = np.zeros((Nx, Ny), dtype=bool)
+    reachable_mask[i0, j0] = True
 
     prev_i = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
     prev_j = np.full((Nt, Nx, Ny, Nz), -1, dtype=int)
@@ -430,6 +480,15 @@ def find_farthest_reachable(
 
     k_start = 0
     k_end = Nt - 1
+
+    # Set up geodesic calculator if latitude/longitude are provided
+    geod: Optional[Geod]
+    if lats is not None and lons is not None:
+        geod = Geod(ellps="WGS84")
+        lat0 = float(lats[i0])
+        lon0 = float(lons[j0])
+    else:
+        geod = None
 
     for k in tqdm(range(k_start, k_end), desc="Searching farthest reachable points"):
         best_value_next = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
@@ -457,8 +516,22 @@ def find_farthest_reachable(
                         i2 = int(next_i[k, l_new, i, j])
                         j2 = int(next_j[k, l_new, i, j])
 
-                        r_prev = np.hypot(i - i0, j - j0)
-                        r_new = np.hypot(i2 - i0, j2 - j0)
+                        # Objective: increase in distance from origin
+                        if geod is not None:
+                            # Geodesic distance (meters) from origin
+                            lat_prev = float(lats[i])
+                            lon_prev = float(lons[j])
+                            lat_new = float(lats[i2])
+                            lon_new = float(lons[j2])
+                            _az1, _az2, d_prev = geod.inv(lon0, lat0, lon_prev, lat_prev)
+                            _az1, _az2, d_new = geod.inv(lon0, lat0, lon_new, lat_new)
+                            r_prev = d_prev
+                            r_new = d_new
+                        else:
+                            # Fallback: Euclidean distance in index space
+                            r_prev = np.hypot(i - i0, j - j0)
+                            r_new = np.hypot(i2 - i0, j2 - j0)
+
                         reward = float(r_new - r_prev)
                         new_value = value_here + reward
 
@@ -475,6 +548,12 @@ def find_farthest_reachable(
                             prev_j[k + 1, i2, j2, l_new] = j
                             prev_l[k + 1, i2, j2, l_new] = l
 
+        # Update global reachable mask with all states reachable at time k+1
+        # on any of the target levels
+        valid_next = np.isfinite(best_value_next) & (best_cost_next <= B)
+        valid_on_targets = valid_next[:, :, target_levels_eff]
+        reachable_mask |= np.any(valid_on_targets, axis=2)
+
         best_value_current = best_value_next
         best_cost_current = best_cost_next
 
@@ -484,14 +563,14 @@ def find_farthest_reachable(
             for j in range(Ny):
                 if land_mask is not None and not land_mask[i, j]:
                     continue
-                for l in levels:
+                for l in target_levels_eff:
                     val = best_value_current[i, j, l]
                     cost = best_cost_current[i, j, l]
                     if np.isfinite(val) and cost <= B:
                         terminal_states.append((float(val), float(cost), (k_check, i, j, l)))
 
     if not terminal_states:
-        return False, None, None, None
+        return False, None, None, None, reachable_mask
 
     terminal_states.sort(key=lambda x: (-x[0], x[1]))
     selected = terminal_states[:k_best]
@@ -521,6 +600,6 @@ def find_farthest_reachable(
         costs.append(cost)
 
     if k_best == 1:
-        return True, paths[0], values[0], costs[0]
+        return True, paths[0], values[0], costs[0], reachable_mask
 
-    return True, paths, np.array(values), np.array(costs)
+    return True, paths, np.array(values), np.array(costs), reachable_mask

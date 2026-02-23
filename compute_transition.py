@@ -13,12 +13,14 @@ from tqdm import tqdm
 DEFAULT_DT = 3600.0  # default timestep in seconds (1 hours, is not tested for timesteps other than 1 hour and migth not work)
 DEFAULT_START = "20240914_20"
 DEFAULT_END = "20240917_20"
+# DEFAULT_START = "20170908_19"
+# DEFAULT_END = "20170911_19"
 DATA_ROOT = "/home/kbrennan/data/era5/cdf"
 OUTPUT_DIR = "/home/kbrennan/data/balloon/transition_matrices"
 
 # Horizontal domain and vertical level range as in test_transition.ipynb
 # Base domain box (lon_min, lon_max, lat_min, lat_max)
-DOMAIN = (-25.0, 35.0, 33.0, 72.0)
+DOMAIN = (-22.0, 38.0, 30.0, 75.0)
 LON_MIN = DOMAIN[0]
 LON_MAX = DOMAIN[1]
 LAT_MIN = DOMAIN[2]
@@ -33,7 +35,7 @@ def main(
     start: str = DEFAULT_START,
     end: str = DEFAULT_END,
     dt: float = DEFAULT_DT,
-    superscale: int = 1,
+    superscale: int = 3,
 ) -> None:
     """Compute transition matrices for all Z files in a given time range.
 
@@ -348,6 +350,33 @@ def compute_transition_indices(
 
     j_new_rounded = np.clip(j_new_rounded, 0, nlat - 1)
     i_new_rounded = np.clip(i_new_rounded, 0, nlon - 1)
+
+    # Enforce self-pointers for any origin cell that lies on the
+    # outermost grid (true boundary nodes), so trajectories
+    # cannot leave the domain or slide along its edge.
+    if u.ndim > 2:
+        lead = int(np.prod(orig_shape[:-2]))
+    else:
+        lead = 1
+
+    j_orig = np.broadcast_to(
+        np.arange(nlat)[np.newaxis, :, np.newaxis],
+        (lead, nlat, nlon),
+    )
+    i_orig = np.broadcast_to(
+        np.arange(nlon)[np.newaxis, np.newaxis, :],
+        (lead, nlat, nlon),
+    )
+
+    boundary_mask = (
+        (j_orig == 0)
+        | (j_orig == nlat - 1)
+        | (i_orig == 0)
+        | (i_orig == nlon - 1)
+    )
+
+    j_new_rounded[boundary_mask] = j_orig[boundary_mask]
+    i_new_rounded[boundary_mask] = i_orig[boundary_mask]
 
     # Reshape back to original dimensions
     lat_indices = j_new_rounded.reshape(orig_shape)
