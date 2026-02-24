@@ -118,6 +118,7 @@ def optimize_point_to_point(
     earliest_arrival: bool = True,
     fixed_arrival_time: Optional[int] = None,
     k_best: int = 1,
+    early_cost_penalty: float = 1_000.0,
 ) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
     """Optimize trajectory from origin to target under a consumable budget.
 
@@ -153,6 +154,12 @@ def optimize_point_to_point(
     fixed_arrival_time : int, optional
         If not ``None``, only consider arrivals exactly at this time index
         ``k*`` (0-based). Incompatible with ``earliest_arrival=True``.
+    early_cost_penalty : float, optional
+        Strength of additional penalty applied to vertical cost spent early in
+        the trajectory. Units are the same as the reward returned by
+        ``reward_fn`` per unit of vertical cost used right at the beginning
+        of the trajectory, and the penalty smoothly decreases to zero towards
+        the end of the time horizon. ``0.0`` (default) disables this shaping.
 
     Returns
     -------
@@ -262,7 +269,21 @@ def optimize_point_to_point(
                         j2 = int(next_j[k, l_new, i, j])
 
                         reward = reward_fn(i, j, i2, j2, target)
-                        new_value = value_here + reward
+
+                        # Optional shaping: penalize using budget early in time.
+                        # This does not change the hard budget constraint, but
+                        # prefers trajectories that defer cost to later steps.
+                        if early_cost_penalty > 0.0 and B > 0.0:
+                            # Map current step k to [0, 1] over usable steps.
+                            # k runs from 0 to k_end-1 where k_end = Nt-1.
+                            horizon = max(1, k_end)
+                            fraction_of_horizon = float(k + 1) / float(horizon)
+                            early_weight = 1.0 - fraction_of_horizon
+                            penalty = early_cost_penalty * early_weight * float(delta_cost)
+                            shaped_reward = reward - penalty
+                            new_value = value_here + shaped_reward
+                        else:
+                            new_value = value_here + reward
 
                         # Dominance check: keep only best (value, cost) pair
                         old_value = best_value_next[i2, j2, l_new]
@@ -347,6 +368,7 @@ def find_farthest_reachable(
     lats: Optional[np.ndarray] = None,
     lons: Optional[np.ndarray] = None,
     k_best: int = 1,
+    early_cost_penalty: float = 1_000.0,
 ) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
     """Find farthest reachable points from the origin under a consumable budget.
 
@@ -390,6 +412,16 @@ def find_farthest_reachable(
     k_best : int, optional
         Number of farthest endpoints (paths) to return. ``1`` (default) returns
         only the single farthest path.
+    early_cost_penalty : float, optional
+        Strength of additional penalty applied to vertical cost spent early in
+        the trajectory. Units are the same as the distance objective (e.g.,
+        meters when using geodesic distances) per unit of vertical cost used
+        right at the beginning of the trajectory, and the penalty smoothly
+        decreases to zero towards the end of the time horizon. For example,
+        ``early_cost_penalty = 100.0`` means that spending one unit of
+        vertical cost in the first step reduces the objective by roughly
+        100 meters compared to spending that unit of cost very late. ``0.0``
+        (default) disables this shaping.
 
     Returns
     -------
@@ -533,7 +565,21 @@ def find_farthest_reachable(
                             r_new = np.hypot(i2 - i0, j2 - j0)
 
                         reward = float(r_new - r_prev)
-                        new_value = value_here + reward
+
+                        # Optional shaping: penalize using budget early in time.
+                        # This does not change the hard budget constraint, but
+                        # prefers trajectories that defer cost to later steps.
+                        if early_cost_penalty > 0.0 and B > 0.0:
+                            # Map current step k to [0, 1] over usable steps.
+                            # k runs from 0 to k_end-1 where k_end = Nt-1.
+                            horizon = max(1, k_end)
+                            fraction_of_horizon = float(k + 1) / float(horizon)
+                            early_weight = 1.0 - fraction_of_horizon
+                            penalty = early_cost_penalty * early_weight * float(delta_cost)
+                            shaped_reward = reward - penalty
+                            new_value = value_here + shaped_reward
+                        else:
+                            new_value = value_here + reward
 
                         old_value = best_value_next[i2, j2, l_new]
                         old_cost = best_cost_next[i2, j2, l_new]
