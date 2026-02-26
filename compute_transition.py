@@ -9,6 +9,7 @@ from typing import List, Optional
 import numpy as np
 import xarray as xr
 from tqdm import tqdm
+from multiprocessing import Pool
 
 DEFAULT_DT = 3600.0  # default timestep in seconds (1 hours, is not tested for timesteps other than 1 hour and migth not work)
 DEFAULT_START = "20240914_20"
@@ -26,9 +27,202 @@ LON_MAX = DOMAIN[1]
 LAT_MIN = DOMAIN[2]
 LAT_MAX = DOMAIN[3]
 
-# Pressure level limits in Pa (500–900 hPa)
-PLEV_MIN = 50_000.0
-PLEV_MAX = 90_000.0
+# Target pressure levels in hPa for the transition matrices
+PRES_LEVELS_HPA = np.array(
+    [1000.0, 950.0, 900.0, 850.0, 800.0, 750.0, 700.0, 650.0, 600.0, 550.0, 500.0],
+    dtype=float,
+)
+
+
+def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Dataset]:
+    """Worker function to compute transition indices for a single P file.
+
+    Parameters
+    ----------
+    args : tuple
+        Tuple of ``(ppath, dt, superscale)`` where ``ppath`` is the path to a
+        single P file.
+
+    Returns
+    -------
+    xr.Dataset or None
+        Transition index dataset for this time step, or ``None`` if the file
+        does not exist or does not contain the required variables.
+    """
+
+    ppath, dt, superscale = args
+
+    pfile = xr.open_dataset(ppath)
+
+    ds_uv = pfile[["U", "V"]].sel(
+        lon=slice(LON_MIN, LON_MAX),
+        lat=slice(LAT_MIN, LAT_MAX),
+    )
+
+    nlev_file = ds_uv.sizes["lev"]
+
+    # Hybrid coefficients (assumed defined on full model levels).
+    hyam = pfile["hyam"].values
+    hybm = pfile["hybm"].values
+
+    # Use the bottom nlev_file levels from the hybrid coefficients so that
+    # they align with the data in the P-file (bottom 98/68 levels depending
+    # on the configuration).
+    hyam_use = hyam[-nlev_file:]
+    hybm_use = hybm[-nlev_file:]
+
+    # Surface pressure PS is stored in hPa in the P-files. Convert to Pa
+    # and use a domain-mean value to construct a single vertical pressure
+    # coordinate profile.
+    ps = pfile["PS"].sel(
+        lon=slice(LON_MIN, LON_MAX),
+        lat=slice(LAT_MIN, LAT_MAX),
+    ) *100.0  # convert hPa to Pa
+
+    # Full model-level pressures (Pa) – 3D: (lev, lat, lon)
+    ps_vals = ps.values  # (1, nlat, nlon) or (nlat, nlon)
+    if ps_vals.ndim == 3:
+        ps_vals = ps_vals[0]  # drop singleton time → (nlat, nlon)
+    plevels_Pa = (
+        hyam_use[:, np.newaxis, np.newaxis]
+        + hybm_use[:, np.newaxis, np.newaxis] * ps_vals[np.newaxis, :, :]
+    )
+    plevels_hPa = plevels_Pa / 100.0  # (nlev_model, nlat, nlon)
+
+    # Interpolate U and V from model levels to the target pressure levels
+    # using the actual local pressure profile at each grid point.
+    lat_vals = ds_uv["lat"].values
+    lon_vals = ds_uv["lon"].values
+
+    u_vals = ds_uv["U"].values.squeeze()  # (nlev_model, nlat, nlon)
+    v_vals = ds_uv["V"].values.squeeze()
+
+    nlev_model, nlat, nlon = u_vals.shape
+    ntarget = len(PRES_LEVELS_HPA)
+
+    # Ensure pressure increases along axis 0 (required by np.interp)
+    if plevels_hPa[0, 0, 0] > plevels_hPa[-1, 0, 0]:
+        plevels_hPa = plevels_hPa[::-1]
+        u_vals = u_vals[::-1]
+        v_vals = v_vals[::-1]
+
+    u_interp = np.empty((ntarget, nlat, nlon))
+    v_interp = np.empty((ntarget, nlat, nlon))
+
+    for j in range(nlat):
+        for i in range(nlon):
+            p_col = plevels_hPa[:, j, i]
+            u_interp[:, j, i] = np.interp(PRES_LEVELS_HPA, p_col, u_vals[:, j, i])
+            v_interp[:, j, i] = np.interp(PRES_LEVELS_HPA, p_col, v_vals[:, j, i])
+
+    ds_uv_plev = xr.Dataset(
+        {
+            "U": (["plev", "lat", "lon"], u_interp),
+            "V": (["plev", "lat", "lon"], v_interp),
+        },
+        coords={
+            "plev": PRES_LEVELS_HPA,
+            "lat": lat_vals,
+            "lon": lon_vals,
+        },
+    )
+
+    transition_ds = compute_transition_indices(
+        ds_uv_plev,
+        dt=dt,
+        superscale=superscale,
+    )
+
+    # Use PS to adjust transitions so that no trajectory can enter grid
+    # points below the surface (where p > PS). PS is in hPa, while plev is
+    # in hPa as well; convert PS to Pa before comparing.
+    ps_on_grid = ps.interp(
+        lon=transition_ds["lon"],
+        lat=transition_ds["lat"],
+    ).squeeze()
+
+    # Ensure ps_on_grid is 2D (lat, lon)
+    if ps_on_grid.ndim == 3 and "time" in ps_on_grid.dims and ps_on_grid.sizes.get(
+        "time",
+        1,
+    ) == 1:
+        ps_on_grid = ps_on_grid.isel(time=0)
+
+    if ps_on_grid.ndim != 2:
+        return None
+
+    plev_vals_hPa = transition_ds["plev"].values  # (Nz,)
+    # Convert PS from hPa to Pa to compare with plev in Pa
+    ps_vals_pa = ps_on_grid.values * 100.0  # (nlat, nlon)
+
+    nlev = plev_vals_hPa.shape[0]
+    nlat_ps, nlon_ps = ps_vals_pa.shape
+
+    # Mask of grid points below the surface for each level
+    # Shape: (Nz, nlat, nlon)
+    plev_vals_pa = plev_vals_hPa * 100.0
+    below_surface_3d = (
+        plev_vals_pa[:, np.newaxis, np.newaxis] > ps_vals_pa[np.newaxis, :, :]
+    )
+
+    # Work with a unified view where the first dimension is time-like (can
+    # be 1 if there is no explicit time dim).
+    lat_da = transition_ds["lat_idx"]
+    lon_da = transition_ds["lon_idx"]
+
+    lat_idx = lat_da.values
+    lon_idx = lon_da.values
+
+    # Ensure vertical and horizontal sizes match PS grid
+    if lat_idx.shape[-3] != nlev:
+        return None
+    if lat_idx.shape[-2] != nlat_ps or lat_idx.shape[-1] != nlon_ps:
+        return None
+
+    if "time" in lat_da.dims:
+        lat_idx_view = lat_idx
+        lon_idx_view = lon_idx
+    else:
+        lat_idx_view = lat_idx[np.newaxis, ...]
+        lon_idx_view = lon_idx[np.newaxis, ...]
+
+    nt_view, nlev_view, nlat, nlon = lat_idx_view.shape
+
+    # Origin indices for self-pointers
+    j_grid, i_grid = np.indices((nlat, nlon))
+
+    # Redirect any transition whose destination is below the surface to
+    # point back to its origin cell.
+    for it in range(nt_view):
+        for k in range(nlev_view):
+            dest_j = lat_idx_view[it, k]
+            dest_i = lon_idx_view[it, k]
+
+            # Boolean mask of destinations that are below surface
+            invalid = below_surface_3d[k, dest_j, dest_i]
+
+            if not np.any(invalid):
+                continue
+
+            lat_idx_view[it, k][invalid] = j_grid[invalid]
+            lon_idx_view[it, k][invalid] = i_grid[invalid]
+
+    # If there was no explicit time dimension, drop the extra axis
+    if "time" not in lat_da.dims:
+        lat_idx = lat_idx_view[0]
+        lon_idx = lon_idx_view[0]
+    else:
+        lat_idx = lat_idx_view
+        lon_idx = lon_idx_view
+
+    # Write adjusted indices back into the Dataset
+    transition_ds["lat_idx"].data = lat_idx
+    transition_ds["lon_idx"].data = lon_idx
+
+    pfile.close()
+
+    return transition_ds
+
 
 
 def main(
@@ -37,7 +231,7 @@ def main(
     dt: float = DEFAULT_DT,
     superscale: int = 3,
 ) -> None:
-    """Compute transition matrices for all Z files in a given time range.
+    """Compute transition matrices for all P files in a given time range.
 
     Parameters
     ----------
@@ -62,133 +256,29 @@ def main(
     # Number of hourly steps between start and end (inclusive)
     nsteps = int((t_end - t_start).total_seconds() // dt) + 1
 
-    for istep in tqdm(range(nsteps), desc="Computing transition matrices"):
+    # Build list of P-file paths to process
+    task_args: list[tuple[str, float, int]] = []
+    for istep in range(nsteps):
         current = t_start + timedelta(hours=istep)
-
         date_code = current.strftime("%Y%m%d_%H")
         year = current.strftime("%Y")
         month = current.strftime("%m")
-        zpath = os.path.join(DATA_ROOT, year, month, f"Z{date_code}")
         ppath = os.path.join(DATA_ROOT, year, month, f"P{date_code}")
-
-        if not os.path.exists(zpath):
-            # Skip missing files rather than aborting the whole range
-            continue
-
-        zfile = xr.open_dataset(zpath)
-        # Only keep U and V for the transition computation and
-        # restrict to the same domain and pressure levels used in
-        # test_transition.ipynb
-        zfile_uv = zfile[["U", "V"]].sel(
-            lon=slice(LON_MIN, LON_MAX),
-            lat=slice(LAT_MIN, LAT_MAX),
-            plev=slice(PLEV_MIN, PLEV_MAX),
-        )
-
-        transition_ds = compute_transition_indices(zfile_uv, dt=dt, superscale=superscale)
-
-        # If a corresponding P-file with PS exists, use it to adjust
-        # transitions so that no trajectory can enter grid points
-        # below the surface (where p > PS). PS is stored in hPa,
-        # while plev is in Pa, so convert PS to Pa before comparing.
         if os.path.exists(ppath):
-            pfile = xr.open_dataset(ppath)
-            try:
-                ps = pfile["PS"].sel(
-                    lon=slice(LON_MIN, LON_MAX),
-                    lat=slice(LAT_MIN, LAT_MAX),
-                )
+            task_args.append((ppath, dt, superscale))
 
-                # Interpolate PS to the (possibly superscaled) grid
-                # used by the transition dataset, then squeeze any
-                # singleton dimensions.
-                ps = ps.interp(
-                    lon=transition_ds["lon"],
-                    lat=transition_ds["lat"],
-                ).squeeze()
+    if not task_args:
+        return
 
-                # Ensure ps is 2D (lat, lon)
-                if ps.ndim == 3 and "time" in ps.dims and ps.sizes.get("time", 1) == 1:
-                    ps = ps.isel(time=0)
-
-                if ps.ndim != 2:
-                    raise ValueError("Unexpected PS dimensions; expected 2D lat/lon")
-
-                plev_vals = transition_ds["plev"].values  # (Nz,)
-                # PS is in hPa in the P-files; convert to Pa
-                ps_vals_pa = ps.values * 100.0  # (nlat, nlon), on same grid as transitions
-
-                nlev = plev_vals.shape[0]
-                nlat_ps, nlon_ps = ps_vals_pa.shape
-
-                # Adjust transition indices so that any transition whose
-                # destination would land below topography instead points
-                # back to the origin cell (self-pointer). This way we do
-                # not need to store an additional validity mask.
-
-                lat_da = transition_ds["lat_idx"]
-                lon_da = transition_ds["lon_idx"]
-
-                lat_idx = lat_da.values
-                lon_idx = lon_da.values
-
-                # Ensure vertical and horizontal sizes match PS grid
-                if lat_idx.shape[-3] != nlev:
-                    raise ValueError("Mismatch between plev dimension and PS levels")
-                if lat_idx.shape[-2] != nlat_ps or lat_idx.shape[-1] != nlon_ps:
-                    raise ValueError("Mismatch between horizontal grid and PS grid")
-
-                # Mask of grid points below the surface for each level
-                # Shape: (Nz, nlat, nlon)
-                below_surface_3d = (
-                    plev_vals[:, np.newaxis, np.newaxis] > ps_vals_pa[np.newaxis, :, :]
-                )
-
-                # Work with a unified view where the first dimension is
-                # time-like (can be 1 if there is no explicit time dim).
-                if "time" in lat_da.dims:
-                    lat_idx_view = lat_idx
-                    lon_idx_view = lon_idx
-                else:
-                    lat_idx_view = lat_idx[np.newaxis, ...]
-                    lon_idx_view = lon_idx[np.newaxis, ...]
-
-                nt_view, nlev_view, nlat, nlon = lat_idx_view.shape
-
-                # Origin indices for self-pointers
-                j_grid, i_grid = np.indices((nlat, nlon))
-
-                # Redirect any transition whose destination is below the
-                # surface to point back to its origin cell.
-                for it in range(nt_view):
-                    for k in range(nlev_view):
-                        dest_j = lat_idx_view[it, k]
-                        dest_i = lon_idx_view[it, k]
-
-                        # Boolean mask of destinations that are below surface
-                        invalid = below_surface_3d[k, dest_j, dest_i]
-
-                        if not np.any(invalid):
-                            continue
-
-                        lat_idx_view[it, k][invalid] = j_grid[invalid]
-                        lon_idx_view[it, k][invalid] = i_grid[invalid]
-
-                # If there was no explicit time dimension, drop the extra axis
-                if "time" not in lat_da.dims:
-                    lat_idx = lat_idx_view[0]
-                    lon_idx = lon_idx_view[0]
-                else:
-                    lat_idx = lat_idx_view
-                    lon_idx = lon_idx_view
-
-                # Write adjusted indices back into the Dataset
-                transition_ds["lat_idx"].data = lat_idx
-                transition_ds["lon_idx"].data = lon_idx
-            finally:
-                pfile.close()
-
-        datasets.append(transition_ds)
+    # Parallel computation of transition matrices
+    with Pool(processes=16) as pool:
+        for ds in tqdm(
+            pool.imap_unordered(_compute_single_transition, task_args),
+            total=len(task_args),
+            desc="Computing transition matrices",
+        ):
+            if ds is not None:
+                datasets.append(ds)
 
     if not datasets:
         return
