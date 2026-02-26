@@ -2,6 +2,7 @@
 computes transition indices and writes transition matrices to NetCDF
 """
 
+import argparse
 import os
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -17,6 +18,7 @@ DEFAULT_END = "20240917_20"
 # DEFAULT_START = "20170908_19"
 # DEFAULT_END = "20170911_19"
 DATA_ROOT = "/home/kbrennan/data/era5/cdf"
+IFS_ROOT = "/net/tropo/atmosdyn/eps/ncdf"
 OUTPUT_DIR = "/home/kbrennan/data/balloon/transition_matrices"
 
 # Horizontal domain and vertical level range as in test_transition.ipynb
@@ -34,73 +36,77 @@ PRES_LEVELS_HPA = np.array(
 )
 
 
-def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Dataset]:
-    """Worker function to compute transition indices for a single P file.
+def _read_and_vinterp(ppath: str) -> Optional[tuple[xr.Dataset, xr.DataArray]]:
+    """Read a P-file and interpolate U/V to target pressure levels.
 
     Parameters
     ----------
-    args : tuple
-        Tuple of ``(ppath, dt, superscale)`` where ``ppath`` is the path to a
-        single P file.
+    ppath : str
+        Path to a single P-file (ERA5 or IFS).
 
     Returns
     -------
-    xr.Dataset or None
-        Transition index dataset for this time step, or ``None`` if the file
-        does not exist or does not contain the required variables.
+    tuple of (ds_uv_plev, ps_da) or None
+        ds_uv_plev : xr.Dataset with U, V on ``(time, plev, lat, lon)``.
+        ps_da : xr.DataArray with PS on ``(time, lat, lon)`` in Pa.
     """
-
-    ppath, dt, superscale = args
+    if not os.path.exists(ppath):
+        return None
 
     pfile = xr.open_dataset(ppath)
+
+    if "U" not in pfile or "V" not in pfile:
+        pfile.close()
+        return None
 
     ds_uv = pfile[["U", "V"]].sel(
         lon=slice(LON_MIN, LON_MAX),
         lat=slice(LAT_MIN, LAT_MAX),
     )
 
+    if "lev" not in ds_uv.dims:
+        pfile.close()
+        return None
+
     nlev_file = ds_uv.sizes["lev"]
 
-    # Hybrid coefficients (assumed defined on full model levels).
     hyam = pfile["hyam"].values
     hybm = pfile["hybm"].values
-
-    # Use the bottom nlev_file levels from the hybrid coefficients so that
-    # they align with the data in the P-file (bottom 98/68 levels depending
-    # on the configuration).
     hyam_use = hyam[-nlev_file:]
     hybm_use = hybm[-nlev_file:]
 
-    # Surface pressure PS is stored in hPa in the P-files. Convert to Pa
-    # and use a domain-mean value to construct a single vertical pressure
-    # coordinate profile.
-    ps = pfile["PS"].sel(
-        lon=slice(LON_MIN, LON_MAX),
-        lat=slice(LAT_MIN, LAT_MAX),
-    ) *100.0  # convert hPa to Pa
+    ps = (
+        pfile["PS"]
+        .sel(
+            lon=slice(LON_MIN, LON_MAX),
+            lat=slice(LAT_MIN, LAT_MAX),
+        )
+        .load()
+        * 100.0  # hPa → Pa
+    )
 
-    # Full model-level pressures (Pa) – 3D: (lev, lat, lon)
-    ps_vals = ps.values  # (1, nlat, nlon) or (nlat, nlon)
+    ps_vals = ps.values
     if ps_vals.ndim == 3:
-        ps_vals = ps_vals[0]  # drop singleton time → (nlat, nlon)
+        ps_2d = ps_vals[0]
+    else:
+        ps_2d = ps_vals
+
     plevels_Pa = (
         hyam_use[:, np.newaxis, np.newaxis]
-        + hybm_use[:, np.newaxis, np.newaxis] * ps_vals[np.newaxis, :, :]
+        + hybm_use[:, np.newaxis, np.newaxis] * ps_2d[np.newaxis, :, :]
     )
-    plevels_hPa = plevels_Pa / 100.0  # (nlev_model, nlat, nlon)
+    plevels_hPa = plevels_Pa / 100.0
 
-    # Interpolate U and V from model levels to the target pressure levels
-    # using the actual local pressure profile at each grid point.
     lat_vals = ds_uv["lat"].values
     lon_vals = ds_uv["lon"].values
+    time_vals = ds_uv["time"].values
 
-    u_vals = ds_uv["U"].values.squeeze()  # (nlev_model, nlat, nlon)
+    u_vals = ds_uv["U"].values.squeeze()
     v_vals = ds_uv["V"].values.squeeze()
 
     nlev_model, nlat, nlon = u_vals.shape
     ntarget = len(PRES_LEVELS_HPA)
 
-    # Ensure pressure increases along axis 0 (required by np.interp)
     if plevels_hPa[0, 0, 0] > plevels_hPa[-1, 0, 0]:
         plevels_hPa = plevels_hPa[::-1]
         u_vals = u_vals[::-1]
@@ -117,31 +123,39 @@ def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Data
 
     ds_uv_plev = xr.Dataset(
         {
-            "U": (["plev", "lat", "lon"], u_interp),
-            "V": (["plev", "lat", "lon"], v_interp),
+            "U": (["time", "plev", "lat", "lon"], u_interp[np.newaxis, ...]),
+            "V": (["time", "plev", "lat", "lon"], v_interp[np.newaxis, ...]),
         },
         coords={
+            "time": time_vals,
             "plev": PRES_LEVELS_HPA,
             "lat": lat_vals,
             "lon": lon_vals,
         },
     )
 
-    transition_ds = compute_transition_indices(
-        ds_uv_plev,
-        dt=dt,
-        superscale=superscale,
-    )
+    pfile.close()
+    return ds_uv_plev, ps
 
-    # Use PS to adjust transitions so that no trajectory can enter grid
-    # points below the surface (where p > PS). PS is in hPa, while plev is
-    # in hPa as well; convert PS to Pa before comparing.
-    ps_on_grid = ps.interp(
+
+def _apply_topo_mask(
+    transition_ds: xr.Dataset,
+    ps_pa: xr.DataArray,
+) -> Optional[xr.Dataset]:
+    """Redirect transitions whose destination is below the surface.
+
+    Parameters
+    ----------
+    transition_ds : xr.Dataset
+        Dataset returned by ``compute_transition_indices``.
+    ps_pa : xr.DataArray
+        Surface pressure in Pa on ``(lat, lon)`` or ``(time, lat, lon)``.
+    """
+    ps_on_grid = ps_pa.interp(
         lon=transition_ds["lon"],
         lat=transition_ds["lat"],
     ).squeeze()
 
-    # Ensure ps_on_grid is 2D (lat, lon)
     if ps_on_grid.ndim == 3 and "time" in ps_on_grid.dims and ps_on_grid.sizes.get(
         "time",
         1,
@@ -151,29 +165,23 @@ def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Data
     if ps_on_grid.ndim != 2:
         return None
 
-    plev_vals_hPa = transition_ds["plev"].values  # (Nz,)
-    # Convert PS from hPa to Pa to compare with plev in Pa
-    ps_vals_pa = ps_on_grid.values * 100.0  # (nlat, nlon)
+    plev_vals_hPa = transition_ds["plev"].values
+    ps_vals_pa = ps_on_grid.values * 100.0
 
     nlev = plev_vals_hPa.shape[0]
     nlat_ps, nlon_ps = ps_vals_pa.shape
 
-    # Mask of grid points below the surface for each level
-    # Shape: (Nz, nlat, nlon)
     plev_vals_pa = plev_vals_hPa * 100.0
     below_surface_3d = (
         plev_vals_pa[:, np.newaxis, np.newaxis] > ps_vals_pa[np.newaxis, :, :]
     )
 
-    # Work with a unified view where the first dimension is time-like (can
-    # be 1 if there is no explicit time dim).
     lat_da = transition_ds["lat_idx"]
     lon_da = transition_ds["lon_idx"]
 
     lat_idx = lat_da.values
     lon_idx = lon_da.values
 
-    # Ensure vertical and horizontal sizes match PS grid
     if lat_idx.shape[-3] != nlev:
         return None
     if lat_idx.shape[-2] != nlat_ps or lat_idx.shape[-1] != nlon_ps:
@@ -187,27 +195,18 @@ def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Data
         lon_idx_view = lon_idx[np.newaxis, ...]
 
     nt_view, nlev_view, nlat, nlon = lat_idx_view.shape
-
-    # Origin indices for self-pointers
     j_grid, i_grid = np.indices((nlat, nlon))
 
-    # Redirect any transition whose destination is below the surface to
-    # point back to its origin cell.
     for it in range(nt_view):
         for k in range(nlev_view):
             dest_j = lat_idx_view[it, k]
             dest_i = lon_idx_view[it, k]
-
-            # Boolean mask of destinations that are below surface
             invalid = below_surface_3d[k, dest_j, dest_i]
-
             if not np.any(invalid):
                 continue
-
             lat_idx_view[it, k][invalid] = j_grid[invalid]
             lon_idx_view[it, k][invalid] = i_grid[invalid]
 
-    # If there was no explicit time dimension, drop the extra axis
     if "time" not in lat_da.dims:
         lat_idx = lat_idx_view[0]
         lon_idx = lon_idx_view[0]
@@ -215,13 +214,42 @@ def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Data
         lat_idx = lat_idx_view
         lon_idx = lon_idx_view
 
-    # Write adjusted indices back into the Dataset
     transition_ds["lat_idx"].data = lat_idx
     transition_ds["lon_idx"].data = lon_idx
 
-    pfile.close()
-
     return transition_ds
+
+
+def _compute_single_transition(args: tuple[str, float, int]) -> Optional[xr.Dataset]:
+    """Worker: read one P-file, vertically interpolate, compute transitions."""
+    ppath, dt, superscale = args
+    result = _read_and_vinterp(ppath)
+    if result is None:
+        return None
+    ds_uv_plev, ps_da = result
+    ds_single = ds_uv_plev.isel(time=0)
+    transition_ds = compute_transition_indices(ds_single, dt=dt, superscale=superscale)
+    return _apply_topo_mask(transition_ds, ps_da)
+
+
+def _compute_transition_from_uv(args) -> Optional[xr.Dataset]:
+    """Worker: compute transitions from pre-interpolated U/V on pressure levels."""
+    u_arr, v_arr, ps_arr, plev, lat, lon, time_val, dt, superscale = args
+    ds_uv = xr.Dataset(
+        {
+            "U": (["plev", "lat", "lon"], u_arr),
+            "V": (["plev", "lat", "lon"], v_arr),
+        },
+        coords={"plev": plev, "lat": lat, "lon": lon},
+    )
+    ps_da = xr.DataArray(
+        ps_arr, dims=["lat", "lon"], coords={"lat": lat, "lon": lon},
+    )
+    transition_ds = compute_transition_indices(ds_uv, dt=dt, superscale=superscale)
+    result = _apply_topo_mask(transition_ds, ps_da)
+    if result is not None:
+        result = result.expand_dims(time=[time_val])
+    return result
 
 
 
@@ -230,22 +258,31 @@ def main(
     end: str = DEFAULT_END,
     dt: float = DEFAULT_DT,
     superscale: int = 3,
+    data_source: str = "era5",
+    ifs_init: Optional[str] = None,
+    ifs_member: Optional[str] = None,
 ) -> None:
-    """Compute transition matrices for all P files in a given time range.
+    """Compute transition matrices for P files in a given time range.
 
     Parameters
     ----------
-    start : str, optional
-        Start date/time in the format ``YYYYMMDD_HH`` (inclusive).
-    end : str, optional
-        End date/time in the format ``YYYYMMDD_HH`` (inclusive).
-    dt : float, optional
-        Advection time step in seconds. Defaults to 3600 s.
-    superscale : int, optional
-        Horizontal superscaling factor. ``1`` uses the native grid,
-        while e.g. ``2`` linearly interpolates U and V onto a grid
-        with roughly twice as many points in each horizontal
-        direction before computing transitions.
+    start : str
+        Start date/time ``YYYYMMDD_HH`` (inclusive).
+    end : str
+        End date/time ``YYYYMMDD_HH`` (inclusive).
+    dt : float
+        Advection time step in seconds.  Defaults to 3600 s.
+    superscale : int
+        Horizontal superscaling factor.
+    data_source : str
+        ``"era5"`` for hourly ERA5 P-files under ``DATA_ROOT``, or
+        ``"ifs"`` for 6-hourly IFS ensemble P-files under ``IFS_ROOT``.
+    ifs_init : str, optional
+        IFS initialisation date, e.g. ``"20260222_00"``.  Required when
+        ``data_source="ifs"``.
+    ifs_member : str, optional
+        IFS ensemble member, e.g. ``"01"``.  Required when
+        ``data_source="ifs"``.
     """
 
     t_start = datetime.strptime(start, "%Y%m%d_%H")
@@ -253,46 +290,149 @@ def main(
 
     datasets: List[xr.Dataset] = []
 
-    # Number of hourly steps between start and end (inclusive)
-    nsteps = int((t_end - t_start).total_seconds() // dt) + 1
+    if data_source == "era5":
+        # ---- ERA5: hourly P-files, one transition per file ----
+        nsteps = int((t_end - t_start).total_seconds() // dt) + 1
+        task_args: list[tuple[str, float, int]] = []
+        for istep in range(nsteps):
+            current = t_start + timedelta(hours=istep)
+            date_code = current.strftime("%Y%m%d_%H")
+            year = current.strftime("%Y")
+            month = current.strftime("%m")
+            ppath = os.path.join(DATA_ROOT, year, month, f"P{date_code}")
+            if os.path.exists(ppath):
+                task_args.append((ppath, dt, superscale))
 
-    # Build list of P-file paths to process
-    task_args: list[tuple[str, float, int]] = []
-    for istep in range(nsteps):
-        current = t_start + timedelta(hours=istep)
-        date_code = current.strftime("%Y%m%d_%H")
-        year = current.strftime("%Y")
-        month = current.strftime("%m")
-        ppath = os.path.join(DATA_ROOT, year, month, f"P{date_code}")
-        if os.path.exists(ppath):
-            task_args.append((ppath, dt, superscale))
+        if not task_args:
+            print("No ERA5 P-files found in the requested time range.")
+            return
 
-    if not task_args:
-        return
+        with Pool(processes=16) as pool:
+            for ds in tqdm(
+                pool.imap_unordered(_compute_single_transition, task_args),
+                total=len(task_args),
+                desc="Computing transition matrices (ERA5)",
+            ):
+                if ds is not None:
+                    datasets.append(ds)
 
-    # Parallel computation of transition matrices
-    with Pool(processes=16) as pool:
-        for ds in tqdm(
-            pool.imap_unordered(_compute_single_transition, task_args),
-            total=len(task_args),
-            desc="Computing transition matrices",
-        ):
-            if ds is not None:
-                datasets.append(ds)
+    elif data_source == "ifs":
+        if ifs_init is None or ifs_member is None:
+            raise ValueError(
+                "ifs_init and ifs_member are required for data_source='ifs'"
+            )
+
+        ifs_dir = os.path.join(IFS_ROOT, ifs_init, ifs_member)
+
+        # ---- IFS: 6-hourly P-files → temporally interpolate to hourly ----
+        # 1. Collect 6h files that bracket the requested time range.
+        dt_6h = timedelta(hours=6)
+        t_first = datetime(
+            t_start.year, t_start.month, t_start.day,
+            (t_start.hour // 6) * 6,
+        )
+        # Round end up to next 6h boundary
+        if t_end.hour % 6 != 0:
+            t_last = t_end.replace(
+                hour=((t_end.hour // 6) + 1) * 6, minute=0, second=0,
+            )
+        else:
+            t_last = t_end
+
+        pfile_paths: list[str] = []
+        t_cur = t_first
+        while t_cur <= t_last:
+            date_code = t_cur.strftime("%Y%m%d_%H")
+            ppath = os.path.join(ifs_dir, f"P{date_code}")
+            if os.path.exists(ppath):
+                pfile_paths.append(ppath)
+            t_cur += dt_6h
+
+        if not pfile_paths:
+            print("No IFS P-files found in the requested time range.")
+            return
+
+        # 2. Read and vertically interpolate each 6h file (parallel).
+        uv_ps_pairs: list[tuple[xr.Dataset, xr.DataArray]] = []
+        with Pool(processes=min(16, len(pfile_paths))) as pool:
+            for result in tqdm(
+                pool.imap(_read_and_vinterp, pfile_paths),
+                total=len(pfile_paths),
+                desc="Reading & vertical interpolation (IFS)",
+            ):
+                if result is not None:
+                    uv_ps_pairs.append(result)
+
+        if not uv_ps_pairs:
+            print("No valid IFS P-files could be processed.")
+            return
+
+        # 3. Concatenate along time and sort.
+        ds_uv_6h = xr.concat(
+            [pair[0] for pair in uv_ps_pairs], dim="time",
+        ).sortby("time")
+
+        ps_das = [
+            pair[1] for pair in uv_ps_pairs if "time" in pair[1].dims
+        ]
+        if not ps_das:
+            print("No valid PS fields available.")
+            return
+        ps_6h = xr.concat(ps_das, dim="time").sortby("time")
+
+        # 4. Generate hourly timestamps and interpolate U, V, PS.
+        hourly_steps = int((t_end - t_start).total_seconds() // 3600) + 1
+        hourly_times = np.array(
+            [t_start + timedelta(hours=h) for h in range(hourly_steps)],
+            dtype="datetime64[ns]",
+        )
+
+        print("Interpolating to hourly timesteps …")
+        ds_uv_hourly = ds_uv_6h.interp(time=hourly_times)
+        ps_hourly = ps_6h.interp(time=hourly_times)
+
+        # 5. Build tasks for each hourly step.
+        plev = PRES_LEVELS_HPA
+        lat = ds_uv_hourly["lat"].values
+        lon = ds_uv_hourly["lon"].values
+
+        hourly_tasks = []
+        for it in range(hourly_steps):
+            u_arr = ds_uv_hourly["U"].isel(time=it).values
+            v_arr = ds_uv_hourly["V"].isel(time=it).values
+            ps_arr = ps_hourly.isel(time=it).values
+            time_val = hourly_times[it]
+            hourly_tasks.append(
+                (u_arr, v_arr, ps_arr, plev, lat, lon, time_val, dt, superscale)
+            )
+
+        # 6. Compute transitions for each hourly step (parallel).
+        with Pool(processes=16) as pool:
+            for ds in tqdm(
+                pool.imap_unordered(_compute_transition_from_uv, hourly_tasks),
+                total=len(hourly_tasks),
+                desc="Computing transition matrices (IFS hourly)",
+            ):
+                if ds is not None:
+                    datasets.append(ds)
+
+    else:
+        raise ValueError(f"Unknown data_source: {data_source!r}")
 
     if not datasets:
+        print("No transition datasets were computed.")
         return
 
-    # Concatenate along time dimension. This assumes each input file has a
-    # single time step and consistent grid/levels.
-    combined = xr.concat(datasets, dim="time")
+    combined = xr.concat(datasets, dim="time").sortby("time")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tag = f"_ifs_{ifs_init}_{ifs_member}" if data_source == "ifs" else ""
     outfile = os.path.join(
         OUTPUT_DIR,
-        f"transition_indices_{start}_{end}_dt{int(dt)}.nc",
+        f"transition_indices_{start}_{end}_dt{int(dt)}{tag}.nc",
     )
     combined.to_netcdf(outfile)
+    print(f"Wrote {outfile}")
 
 
 def compute_transition_indices(
@@ -499,4 +639,28 @@ def compute_transition_indices(
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Compute transition matrices")
+    parser.add_argument("--source", default="era5", choices=["era5", "ifs"],
+                        help="Data source (default: era5)")
+    parser.add_argument("--start", default=DEFAULT_START,
+                        help="Start date YYYYMMDD_HH")
+    parser.add_argument("--end", default=DEFAULT_END,
+                        help="End date YYYYMMDD_HH")
+    parser.add_argument("--dt", type=float, default=DEFAULT_DT,
+                        help="Advection timestep in seconds (default: 3600)")
+    parser.add_argument("--superscale", type=int, default=3,
+                        help="Horizontal superscaling factor (default: 3)")
+    parser.add_argument("--ifs-init", default=None,
+                        help="IFS init date, e.g. 20260222_00")
+    parser.add_argument("--ifs-member", default=None,
+                        help="IFS ensemble member, e.g. 01")
+    args = parser.parse_args()
+    main(
+        start=args.start,
+        end=args.end,
+        dt=args.dt,
+        superscale=args.superscale,
+        data_source=args.source,
+        ifs_init=args.ifs_init,
+        ifs_member=args.ifs_member,
+    )
