@@ -6,7 +6,7 @@ End-to-end pipeline that:
   1. Reads a configuration file (params.txt).
   2. Computes (or reuses) transition matrices for each ensemble member.
   3. Runs find_farthest_reachable() in parallel across members.
-  4. Produces per-member and probabilistic diagnostic outputs.
+  4. Produces per-member and probabilistic diagnostic outputs (NetCDF + PNG).
 
 Usage
 -----
@@ -14,6 +14,34 @@ Usage
 
 If no path is given, the script looks for ``params.txt`` in the same
 directory as this script.
+
+Public API for notebooks / interactive inspection
+-------------------------------------------------
+The following functions load saved NetCDF output files and return
+``matplotlib.Figure`` objects – they do **not** require re-running the
+pipeline:
+
+``plot_member_from_nc(member_dir, member, start_lat, start_lon)``
+    Load ``trajectories.nc`` and ``reachable_mask.nc`` from one member
+    directory and return ``(fig_map, fig_pressure_profiles)``.
+
+``plot_member_by_target(member_dir, member, target_lat, target_lon, radius_km)``
+    Return a pressure-profile figure for trajectories ending within
+    *radius_km* of the given target point, or *None* if none found.
+
+``plot_probabilistic_from_nc(run_dir, members, start_lat, start_lon)``
+    Load ``probabilistic/probabilistic.nc`` (and optional landing-zone
+    files) and return a dict of figures keyed by
+    ``"prob_map"``, ``"histogram"``, ``"landing_zones_map"``,
+    ``"landing_zones_profiles"``.
+
+Private map / plot helpers
+--------------------------
+All map-drawing code is consolidated in a set of private helpers
+(``_make_map_axes``, ``_set_map_extent``, ``_add_gridlines``,
+``_plot_frac_contourf``, ``_make_histogram_fig``, ``_make_lz_map``,
+``_make_lz_profiles``) so that the pipeline's save functions and the
+notebook's plot functions share identical rendering logic.
 """
 
 from __future__ import annotations
@@ -380,20 +408,10 @@ def plot_member(
     lats_best = lats[i_best]
     lons_best = lons[j_best]
 
-    proj_center = (float(lons_best.mean()), float(lats_best.mean()))
-    projection = ccrs.RotatedPole(
-        pole_longitude=proj_center[0] - 180.0,
-        pole_latitude=90.0 - proj_center[1],
-    )
-    padding = 5.0
-
     # ---- 1) Map --------------------------------------------------------------
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7),
-                           subplot_kw={"projection": projection})
-    ax.coastlines(resolution="50m", alpha=0.5)
-    ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.4)
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-    ax.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.4)
+    fig, ax = _make_map_axes(
+        float(lons_best.mean()), float(lats_best.mean()), figsize=(8, 7)
+    )
 
     # Shade reachable area
     if rmasked is not None:
@@ -425,17 +443,8 @@ def plot_member(
     ax.scatter([start_lon], [start_lat], color="tab:blue", marker="o",
                s=60, zorder=8, transform=ccrs.PlateCarree(), label="Origin")
 
-    ax.set_extent(
-        [float(lons_best.min()) - padding, float(lons_best.max()) + padding,
-         float(lats_best.min()) - padding, float(lats_best.max()) + padding],
-        crs=ccrs.PlateCarree(),
-    )
-    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
-                      y_inline=False, linewidth=0.5, color="black",
-                      alpha=0.5, linestyle=(0, (15, 10)))
-    gl.top_labels = False
-    gl.right_labels = False
-
+    _set_map_extent(ax, lons_best, lats_best, padding=5.0)
+    _add_gridlines(ax)
     ax.set_title(f"Member {result['member']} – top {len(paths)} trajectories")
     fig.tight_layout()
     map_path = os.path.join(member_dir, "reachable_map.png")
@@ -493,6 +502,253 @@ def _plot_geodesic_circle(
         lons_c.append(lon)
     ax.plot(lons_c, lats_c, "--", color=color, linewidth=1.0,
             alpha=0.7, transform=ccrs.PlateCarree(), zorder=6)
+
+
+# =========================================================================== #
+# Zone colours (used by landing-zone helpers and plots)                        #
+# =========================================================================== #
+
+_ZONE_COLORS = ["tab:orange", "tab:green", "tab:purple", "tab:red", "tab:cyan"]
+
+
+# =========================================================================== #
+# Private map / plot helpers                                                   #
+# Shared by both the pipeline save functions and the notebook plot functions.  #
+# Extracted to avoid repetition across plot_member, save_and_plot_landing_zones, #
+# compute_and_save_probabilistic, plot_member_from_nc, and                     #
+# plot_probabilistic_from_nc.                                                  #
+# =========================================================================== #
+
+def _make_map_axes(
+    center_lon: float,
+    center_lat: float,
+    figsize: Tuple[float, float] = (10, 8),
+) -> Tuple[plt.Figure, Any]:
+    """Create a Cartopy GeoAxes with RotatedPole projection centred on the data.
+
+    The figure comes pre-loaded with coastlines, ocean, borders, and land
+    background features.  Complete setup by calling::
+
+        _set_map_extent(ax, lons, lats)   # fix the visible domain
+        _add_gridlines(ax)                # add labelled gridlines
+    """
+    projection = ccrs.RotatedPole(
+        pole_longitude=center_lon - 180.0,
+        pole_latitude=90.0 - center_lat,
+    )
+    fig, ax = plt.subplots(1, 1, figsize=figsize,
+                           subplot_kw={"projection": projection})
+    ax.coastlines(resolution="50m", alpha=0.6)
+    ax.add_feature(cfeature.OCEAN,                   facecolor="lightblue",   alpha=0.3)
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"),                        alpha=0.2)
+    ax.add_feature(cfeature.LAND,                    facecolor="lightyellow", alpha=0.3)
+    return fig, ax
+
+
+def _set_map_extent(
+    ax,
+    lons: np.ndarray,
+    lats: np.ndarray,
+    padding: float = 0.0,
+) -> None:
+    """Set the map extent from array bounds with optional padding in degrees."""
+    ax.set_extent(
+        [float(lons.min()) - padding, float(lons.max()) + padding,
+         float(lats.min()) - padding, float(lats.max()) + padding],
+        crs=ccrs.PlateCarree(),
+    )
+
+
+def _set_map_extent_from_nonzero(
+    ax,
+    lons: np.ndarray,
+    lats: np.ndarray,
+    frac: np.ndarray,
+    padding_frac: float = 0.2,
+) -> None:
+    """Set extent to the bounding box of non-zero *frac* cells plus relative padding.
+
+    Parameters
+    ----------
+    padding_frac:
+        Fraction of the non-zero bounding-box span to add as margin on each
+        side (default 0.20 → 20 %).
+    """
+    mask = frac > 0
+    if not mask.any():
+        _set_map_extent(ax, lons, lats)
+        return
+    # lons/lats may be 1-D coordinate vectors; build 2-D grids if needed so
+    # boolean indexing with the 2-D mask always works correctly.
+    if lons.ndim == 1 and lats.ndim == 1:
+        lons_2d, lats_2d = np.meshgrid(lons, lats)
+    else:
+        lons_2d, lats_2d = lons, lats
+    lons_nz = lons_2d[mask]
+    lats_nz = lats_2d[mask]
+    lon_min, lon_max = float(lons_nz.min()), float(lons_nz.max())
+    lat_min, lat_max = float(lats_nz.min()), float(lats_nz.max())
+    pad_lon = (lon_max - lon_min) * padding_frac
+    pad_lat = (lat_max - lat_min) * padding_frac * np.cos(np.radians((lat_min + lat_max) / 2))
+    ax.set_extent(
+        [lon_min - pad_lon, lon_max + pad_lon,
+         lat_min - pad_lat, lat_max + pad_lat],
+        crs=ccrs.PlateCarree(),
+    )
+
+
+def _add_gridlines(ax) -> None:
+    """Add the standard labelled gridlines to a GeoAxes."""
+    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
+                      y_inline=False, linewidth=0.5, color="black",
+                      alpha=0.5, linestyle=(0, (15, 10)))
+    gl.top_labels   = False
+    gl.right_labels = False
+
+
+def _plot_frac_contourf(
+    ax,
+    fig: plt.Figure,
+    lons: np.ndarray,
+    lats: np.ndarray,
+    frac: np.ndarray,
+    alpha: float = 0.85,
+    cbar_label: str = "Fraction of members\nwith grid point reachable",
+    mask_zeros: bool = True,
+    n_levels: int = 10,
+) -> Any:
+    """Draw a filled-contour overlay of *frac* and attach a colour bar.
+
+    Parameters
+    ----------
+    ax, fig
+        GeoAxes and parent Figure from ``_make_map_axes``.
+    lons, lats
+        1-D coordinate arrays matching the shape of *frac*.
+    frac
+        2-D fraction field, values in [0, 1].
+    alpha
+        Transparency of the fill; default 0.85.
+    cbar_label
+        Text for the colour-bar label.
+    mask_zeros
+        When True (default), grid points where *frac* equals exactly zero are
+        masked so the background map shows through.
+    n_levels : int
+        Number of contour levels.  Pass the ensemble size so that each level
+        corresponds to exactly one additional member being reachable
+        (levels = 1/N, 2/N, …, 1).  Default 10.
+
+    Returns
+    -------
+    The ``QuadContourSet`` returned by ``contourf``.
+    """
+    data = np.ma.masked_where(frac == 0, frac) if mask_zeros else frac
+    cf = ax.contourf(lons, lats, data,
+                     levels=np.linspace(0, 1, n_levels), cmap=cmc.batlowW_r,
+                     transform=ccrs.PlateCarree(),
+                     alpha=alpha, extend="neither")
+    cbar = fig.colorbar(cf, ax=ax, orientation="vertical", pad=0.02, shrink=0.75)
+    cbar.set_ticks(np.linspace(0, 1, 11))
+    cbar.set_ticklabels([f"{v:.1f}" for v in np.linspace(0, 1, 11)])
+    cbar.set_label(cbar_label, fontsize=9)
+    return cf
+
+
+def _make_histogram_fig(dist_m: np.ndarray) -> Optional[plt.Figure]:
+    """Return a histogram figure for per-member maximum distances (m).
+
+    Returns *None* when there are no finite values in *dist_m*.
+    """
+    finite = dist_m[np.isfinite(dist_m)]
+    if finite.size == 0:
+        return None
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(finite / 1000.0, bins=min(len(finite), 20),
+            color="steelblue", edgecolor="white", alpha=0.8)
+    ax.axvline(np.nanmedian(dist_m) / 1000.0, color="k", linestyle="--",
+               linewidth=1.5, label=f"Median {np.nanmedian(dist_m)/1e3:.0f} km")
+    ax.axvline(np.nanmean(dist_m) / 1000.0, color="red", linestyle=":",
+               linewidth=1.5, label=f"Mean {np.nanmean(dist_m)/1e3:.0f} km")
+    ax.set_xlabel("Max reachable distance (km)")
+    ax.set_ylabel("Count")
+    ax.set_title("Ensemble spread of maximum reachable distance")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _make_lz_map(
+    zones: List[Dict],
+    lons: np.ndarray,
+    lats: np.ndarray,
+    frac: np.ndarray,
+    start_lat: float,
+    start_lon: float,
+) -> plt.Figure:
+    """Return the landing-zones overview map figure.
+
+    Each element of *zones* must contain ``centroid_lat``, ``centroid_lon``,
+    ``mean_frac``, and a ``trajectories`` sub-dict with list-of-array entries
+    ``lat``, ``lon``, and ``member`` (as returned by
+    ``identify_landing_zones``, or built from NetCDF data).
+    """
+    fig, ax = _make_map_axes(float(lons.mean()), float(lats.mean()))
+    _plot_frac_contourf(ax, fig, lons, lats, frac, alpha=0.65,
+                        cbar_label="Fraction reachable")
+
+    for z_idx, zone in enumerate(zones):
+        color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
+        traj  = zone["trajectories"]
+        for i in range(len(traj["lat"])):
+            ax.plot(traj["lon"][i], traj["lat"][i], "-", color=color,
+                    alpha=0.35, linewidth=0.8, transform=ccrs.PlateCarree())
+        _plot_geodesic_circle(ax, zone["centroid_lat"], zone["centroid_lon"],
+                              200.0, color=color)
+        ax.scatter([zone["centroid_lon"]], [zone["centroid_lat"]],
+                   color=color, marker="*", s=200, zorder=9,
+                   transform=ccrs.PlateCarree(),
+                   label=(f"Zone {z_idx}  n={len(traj['member'])}  "
+                          f"frac={zone['mean_frac']:.2f}"))
+
+    ax.scatter([start_lon], [start_lat], color="black", marker="o",
+               s=80, zorder=10, transform=ccrs.PlateCarree(), label="Origin")
+    _set_map_extent(ax, lons, lats)
+    ax.legend(loc="lower left", fontsize=8)
+    _add_gridlines(ax)
+    ax.set_title("Suggested landing zones with matching trajectories", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def _make_lz_profiles(zones: List[Dict]) -> plt.Figure:
+    """Return the per-zone pressure-profile figure.
+
+    *zones* must be in the same format as described for ``_make_lz_map``.  The
+    ``trajectories`` sub-dict must contain ``time_h`` and ``plev`` as lists of
+    1-D arrays.
+    """
+    n = len(zones)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), sharey=True)
+    if n == 1:
+        axes = [axes]
+    for z_idx, zone in enumerate(zones):
+        ax    = axes[z_idx]
+        color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
+        traj  = zone["trajectories"]
+        for i in range(len(traj["time_h"])):
+            t = np.asarray(traj["time_h"][i], dtype=float)
+            p = np.asarray(traj["plev"][i],   dtype=float)
+            ok = np.isfinite(t) & np.isfinite(p)
+            ax.plot(t[ok], p[ok], "-", color=color, alpha=0.4, linewidth=0.8)
+        ax.set_title(f"Zone {z_idx}\n({len(traj['member'])} traj)", fontsize=9)
+        ax.set_xlabel("Time after start (h)")
+        if z_idx == 0:
+            ax.set_ylabel("Pressure (hPa)")
+        ax.invert_yaxis()
+    fig.suptitle("Pressure profiles by landing zone", fontsize=11)
+    fig.tight_layout()
+    return fig
 
 
 def save_member_netcdf(
@@ -620,9 +876,6 @@ def save_member_netcdf(
 # =========================================================================== #
 # Landing zone identification                                                   #
 # =========================================================================== #
-
-_ZONE_COLORS = ["tab:orange", "tab:green", "tab:purple", "tab:red", "tab:cyan"]
-
 
 def identify_landing_zones(
     frac_reachable: np.ndarray,
@@ -850,84 +1103,18 @@ def save_and_plot_landing_zones(
         ds_z.to_netcdf(nc_path)
         logger.info("Saved %s  (%d trajectories)", nc_path, n_t)
 
-    # ---- Plot 1: map with zones -----------------------------------------------
-    proj_center = (float(lons.mean()), float(lats.mean()))
-    projection  = ccrs.RotatedPole(
-        pole_longitude=proj_center[0] - 180.0,
-        pole_latitude=90.0 - proj_center[1],
-    )
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8),
-                           subplot_kw={"projection": projection})
-    ax.coastlines(resolution="50m", alpha=0.6)
-    ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.3)
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-    ax.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.3)
-
-    cf = ax.contourf(lons, lats, frac_reachable,
-                     levels=np.linspace(0, 1, 11), cmap=cmc.batlow_r,
-                     transform=ccrs.PlateCarree(), alpha=0.65)
-    cbar = fig.colorbar(cf, ax=ax, orientation="vertical", pad=0.02, shrink=0.85)
-    cbar.set_label("Fraction reachable", fontsize=9)
-
-    for z_idx, zone in enumerate(zones):
-        color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
-        traj  = zone["trajectories"]
-        for i in range(len(traj["lat"])):
-            ax.plot(traj["lon"][i], traj["lat"][i], "-", color=color,
-                    alpha=0.35, linewidth=0.8, transform=ccrs.PlateCarree())
-        _plot_geodesic_circle(ax, zone["centroid_lat"], zone["centroid_lon"],
-                              200.0, color=color)
-        ax.scatter([zone["centroid_lon"]], [zone["centroid_lat"]],
-                   color=color, marker="*", s=200, zorder=9,
-                   transform=ccrs.PlateCarree(),
-                   label=(f"Zone {z_idx}  "
-                          f"n={len(traj['member'])}  "
-                          f"frac={zone['mean_frac']:.2f}"))
-
-    ax.scatter([start_lon], [start_lat], color="black", marker="o",
-               s=80, zorder=10, transform=ccrs.PlateCarree(), label="Origin")
-    ax.set_extent([float(lons.min()), float(lons.max()),
-                   float(lats.min()), float(lats.max())],
-                  crs=ccrs.PlateCarree())
-    ax.legend(loc="lower left", fontsize=8)
-    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
-                      y_inline=False, linewidth=0.5, color="black",
-                      alpha=0.5, linestyle=(0, (15, 10)))
-    gl.top_labels = False
-    gl.right_labels = False
-    ax.set_title("Suggested landing zones with matching trajectories", fontsize=11)
-    fig.tight_layout()
+    # ---- Plot 1: landing-zones map ------------------------------------------
+    fig_map = _make_lz_map(zones, lons, lats, frac_reachable, start_lat, start_lon)
     map_path = os.path.join(prob_dir, "landing_zones_map.png")
-    fig.savefig(map_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    fig_map.savefig(map_path, dpi=150, bbox_inches="tight")
+    plt.close(fig_map)
     logger.info("Saved %s", map_path)
 
-    # ---- Plot 2: per-zone pressure profiles -----------------------------------
-    fig2, axes = plt.subplots(1, n_zones, figsize=(4 * n_zones, 4), sharey=True)
-    if n_zones == 1:
-        axes = [axes]
-
-    for z_idx, zone in enumerate(zones):
-        ax2   = axes[z_idx]
-        color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
-        traj  = zone["trajectories"]
-        for i in range(len(traj["time_h"])):
-            t = np.asarray(traj["time_h"][i], dtype=float)
-            p = np.asarray(traj["plev"][i],   dtype=float)
-            ok = np.isfinite(t) & np.isfinite(p)
-            ax2.plot(t[ok], p[ok], "-", color=color, alpha=0.4, linewidth=0.8)
-        ax2.set_title(f"Zone {z_idx}\n({len(traj['member'])} traj)", fontsize=9)
-        ax2.set_xlabel("Time after start (h)")
-        if z_idx == 0:
-            ax2.set_ylabel("Pressure (hPa)")
-        ax2.invert_yaxis()
-
-    fig2.suptitle("Pressure profiles by landing zone", fontsize=11)
-    fig2.tight_layout()
+    # ---- Plot 2: per-zone pressure profiles ----------------------------------
+    fig_pprof = _make_lz_profiles(zones)
     pprof_path = os.path.join(prob_dir, "landing_zones_pressure_profiles.png")
-    fig2.savefig(pprof_path, dpi=150, bbox_inches="tight")
-    plt.close(fig2)
+    fig_pprof.savefig(pprof_path, dpi=150, bbox_inches="tight")
+    plt.close(fig_pprof)
     logger.info("Saved %s", pprof_path)
 
 
@@ -1009,59 +1196,26 @@ def compute_and_save_probabilistic(
     logger.info("Saved %s", prob_nc)
 
     # ---- Probabilistic map --------------------------------------------------
-    # Use a RotatedPole centred on the data domain
-    proj_center = (float(lons.mean()), float(lats.mean()))
-    projection = ccrs.RotatedPole(
-        pole_longitude=proj_center[0] - 180.0,
-        pole_latitude=90.0 - proj_center[1],
-    )
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8),
-                           subplot_kw={"projection": projection})
-    ax.coastlines(resolution="50m", alpha=0.6)
-    ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.3)
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-    ax.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.3)
-
-    cf = ax.contourf(
-        lons, lats, frac_reachable,
-        levels=np.linspace(0, 1, 11),
-        cmap=cmc.batlow_r,
-        transform=ccrs.PlateCarree(),
-        alpha=0.8,
-    )
-    cbar = fig.colorbar(cf, ax=ax, orientation="vertical", pad=0.02, shrink=0.85)
-    cbar.set_label("Fraction of members\nwith grid point reachable", fontsize=9)
+    fig, ax = _make_map_axes(float(lons.mean()), float(lats.mean()))
+    _plot_frac_contourf(ax, fig, lons, lats, frac_reachable, alpha=0.8,
+                        mask_zeros=True, n_levels=n_members)
 
     # Overlay best trajectories from each member (very faint)
     for r in valid:
         if r["paths"] is None:
             continue
         ps = r["paths"] if isinstance(r["paths"], list) else [r["paths"]]
-        lp = r["lats"][ps[0][:, 1]]
-        lnp = r["lons"][ps[0][:, 2]]
-        ax.plot(lnp, lp, "-", color="k", alpha=0.3, linewidth=0.5,
-                transform=ccrs.PlateCarree())
+        ax.plot(r["lons"][ps[0][:, 2]], r["lats"][ps[0][:, 1]], "-",
+                color="k", alpha=0.3, linewidth=0.5, transform=ccrs.PlateCarree())
 
     ax.scatter([start_lon], [start_lat], color="black", marker="o",
                s=80, zorder=8, transform=ccrs.PlateCarree(), label="Origin")
-
-    ax.set_extent(
-        [float(lons.min()), float(lons.max()),
-         float(lats.min()), float(lats.max())],
-        crs=ccrs.PlateCarree(),
-    )
-    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
-                      y_inline=False, linewidth=0.5, color="black",
-                      alpha=0.5, linestyle=(0, (15, 10)))
-    gl.top_labels = False
-    gl.right_labels = False
+    _set_map_extent_from_nonzero(ax, lons, lats, frac_reachable)
+    _add_gridlines(ax)
     ax.set_title(
         f"Probabilistic reachability  –  {n_members} members\n"
-        f"Origin: ({start_lat:.3f}°N, {start_lon:.3f}°E)",
-        fontsize=11,
+        f"Origin: ({start_lat:.3f}°N, {start_lon:.3f}°E)", fontsize=11,
     )
-
     fig.tight_layout()
     prob_map = os.path.join(prob_dir, "prob_reachable_map.png")
     fig.savefig(prob_map, dpi=150, bbox_inches="tight")
@@ -1069,23 +1223,11 @@ def compute_and_save_probabilistic(
     logger.info("Saved %s", prob_map)
 
     # ---- Max-range histogram ------------------------------------------------
-    finite_dists = max_dist_arr[np.isfinite(max_dist_arr)]
-    if finite_dists.size > 0:
-        fig3, ax3 = plt.subplots(figsize=(6, 4))
-        ax3.hist(finite_dists / 1000.0, bins=min(len(finite_dists), 20),
-                 color="steelblue", edgecolor="white", alpha=0.8)
-        ax3.axvline(np.nanmedian(max_dist_arr) / 1000.0, color="k",
-                    linestyle="--", linewidth=1.5, label="Median")
-        ax3.axvline(np.nanmean(max_dist_arr) / 1000.0, color="red",
-                    linestyle=":", linewidth=1.5, label="Mean")
-        ax3.set_xlabel("Max reachable distance (km)")
-        ax3.set_ylabel("Count")
-        ax3.set_title("Ensemble spread of maximum reachable distance")
-        ax3.legend()
-        fig3.tight_layout()
+    fig_hist = _make_histogram_fig(max_dist_arr)
+    if fig_hist is not None:
         hist_path = os.path.join(prob_dir, "max_range_histogram.png")
-        fig3.savefig(hist_path, dpi=150, bbox_inches="tight")
-        plt.close(fig3)
+        fig_hist.savefig(hist_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_hist)
         logger.info("Saved %s", hist_path)
 
     # ---- Summary stats to log -----------------------------------------------
@@ -1167,20 +1309,9 @@ def plot_member_from_nc(
     lat_best = lats_traj[0][np.isfinite(lats_traj[0])]
     lon_best = lons_traj[0][np.isfinite(lons_traj[0])]
 
-    proj_center = (float(lon_best.mean()), float(lat_best.mean()))
-    projection  = ccrs.RotatedPole(
-        pole_longitude=proj_center[0] - 180.0,
-        pole_latitude=90.0 - proj_center[1],
-    )
-
     # ---- Map ----------------------------------------------------------------
-    fig_map, ax = plt.subplots(1, 1, figsize=(8, 7),
-                               subplot_kw={"projection": projection})
-    ax.coastlines(resolution="50m", alpha=0.5)
-    ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.4)
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-    ax.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.4)
-
+    fig_map, ax = _make_map_axes(float(lon_best.mean()), float(lat_best.mean()),
+                                 figsize=(8, 7))
     ax.contourf(lons_grid, lats_grid, reachable,
                 levels=[0.5, 1.5], colors=["red"], alpha=0.25,
                 transform=ccrs.PlateCarree())
@@ -1197,16 +1328,8 @@ def plot_member_from_nc(
     ax.scatter([start_lon], [start_lat], color="k", marker="o",
                s=60, zorder=8, transform=ccrs.PlateCarree())
 
-    ax.set_extent(
-        [float(lon_best.min()) - padding, float(lon_best.max()) + padding,
-         float(lat_best.min()) - padding, float(lat_best.max()) + padding],
-        crs=ccrs.PlateCarree(),
-    )
-    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
-                      y_inline=False, linewidth=0.5, color="black",
-                      alpha=0.5, linestyle=(0, (15, 10)))
-    gl.top_labels = False
-    gl.right_labels = False
+    _set_map_extent(ax, lon_best, lat_best, padding=padding)
+    _add_gridlines(ax)
     ax.set_title(
         f"Member {member} – top {n_traj} trajectories  |  "
         f"best range {float(dists_m[0])/1000:.0f} km"
@@ -1330,22 +1453,9 @@ def plot_probabilistic_from_nc(
     figures: Dict[str, plt.Figure] = {}
 
     # ---- Probabilistic map --------------------------------------------------
-    proj_center = (float(lons.mean()), float(lats.mean()))
-    projection  = ccrs.RotatedPole(
-        pole_longitude=proj_center[0] - 180.0,
-        pole_latitude=90.0 - proj_center[1],
-    )
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8),
-                           subplot_kw={"projection": projection})
-    ax.coastlines(resolution="50m", alpha=0.6)
-    ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.3)
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-    ax.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.3)
-
-    cf = ax.contourf(lons, lats, frac, levels=np.linspace(0, 1, 11),
-                     cmap=cmc.batlow_r, transform=ccrs.PlateCarree(), alpha=0.85)
-    cbar = fig.colorbar(cf, ax=ax, orientation="vertical", pad=0.02, shrink=0.85)
-    cbar.set_label("Fraction of members\nwith grid point reachable", fontsize=9)
+    fig, ax = _make_map_axes(float(lons.mean()), float(lats.mean()))
+    _plot_frac_contourf(ax, fig, lons, lats, frac, alpha=0.85,
+                        mask_zeros=True, n_levels=n_mem)
 
     # Overlay best trajectory from each member
     for m in members:
@@ -1360,14 +1470,8 @@ def plot_probabilistic_from_nc(
 
     ax.scatter([start_lon], [start_lat], color="black", marker="o",
                s=80, zorder=8, transform=ccrs.PlateCarree())
-    ax.set_extent([float(lons.min()), float(lons.max()),
-                   float(lats.min()), float(lats.max())],
-                  crs=ccrs.PlateCarree())
-    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False,
-                      y_inline=False, linewidth=0.5, color="black",
-                      alpha=0.5, linestyle=(0, (15, 10)))
-    gl.top_labels = False
-    gl.right_labels = False
+    _set_map_extent_from_nonzero(ax, lons, lats, frac)
+    _add_gridlines(ax)
     ax.set_title(
         f"Probabilistic reachability  –  {n_mem} members\n"
         f"Origin: ({start_lat:.3f}°N, {start_lon:.3f}°E)", fontsize=11)
@@ -1375,23 +1479,9 @@ def plot_probabilistic_from_nc(
     figures["prob_map"] = fig
 
     # ---- Max-range histogram ------------------------------------------------
-    finite_dists = dist_m[np.isfinite(dist_m)]
-    if finite_dists.size > 0:
-        fig3, ax3 = plt.subplots(figsize=(6, 4))
-        ax3.hist(finite_dists / 1000.0, bins=min(len(finite_dists), 20),
-                 color="steelblue", edgecolor="white", alpha=0.8)
-        ax3.axvline(np.nanmedian(dist_m) / 1000.0, color="k", linestyle="--",
-                    linewidth=1.5,
-                    label=f"Median {np.nanmedian(dist_m)/1e3:.0f} km")
-        ax3.axvline(np.nanmean(dist_m) / 1000.0, color="red", linestyle=":",
-                    linewidth=1.5,
-                    label=f"Mean {np.nanmean(dist_m)/1e3:.0f} km")
-        ax3.set_xlabel("Max reachable distance (km)")
-        ax3.set_ylabel("Count")
-        ax3.set_title("Ensemble spread of maximum reachable distance")
-        ax3.legend()
-        fig3.tight_layout()
-        figures["histogram"] = fig3
+    fig_hist = _make_histogram_fig(dist_m)
+    if fig_hist is not None:
+        figures["histogram"] = fig_hist
 
         print("=== Probabilistic Summary ===")
         for m_id, d in zip(ds_prob["member"].values, dist_m):
@@ -1409,87 +1499,32 @@ def plot_probabilistic_from_nc(
         ds_lz = xr.open_dataset(lz_nc)
         n_zones = int(ds_lz.dims["zone"])
 
-        # Re-read per-zone trajectory files for plotting
-        zone_traj_data: List[Dict] = []
+        # Re-read per-zone trajectory files and normalise into zones format
+        zones_for_plot: List[Dict] = []
         for z_idx in range(n_zones):
             zt_nc = os.path.join(prob_dir, f"landing_zone_{z_idx}_trajectories.nc")
-            if os.path.exists(zt_nc):
-                zt = xr.open_dataset(zt_nc, decode_times=False)
-                zone_traj_data.append(dict(
-                    lat=zt["lat"].values,
-                    lon=zt["lon"].values,
-                    plev=zt["plev"].values,
-                    time_h=zt["time_h"].values,
-                    centroid_lat=float(ds_lz["centroid_lat"].values[z_idx]),
-                    centroid_lon=float(ds_lz["centroid_lon"].values[z_idx]),
-                    mean_frac=float(ds_lz["mean_fraction"].values[z_idx]),
-                    n_traj=int(ds_lz["n_trajectories"].values[z_idx]),
-                ))
-                zt.close()
+            if not os.path.exists(zt_nc):
+                continue
+            with xr.open_dataset(zt_nc, decode_times=False) as zt:
+                n_t   = zt.dims["trajectory"]
+                zones_for_plot.append({
+                    "centroid_lat": float(ds_lz["centroid_lat"].values[z_idx]),
+                    "centroid_lon": float(ds_lz["centroid_lon"].values[z_idx]),
+                    "mean_frac":    float(ds_lz["mean_fraction"].values[z_idx]),
+                    "trajectories": {
+                        "lat":    [zt["lat"].values[i]    for i in range(n_t)],
+                        "lon":    [zt["lon"].values[i]    for i in range(n_t)],
+                        "plev":   [zt["plev"].values[i]   for i in range(n_t)],
+                        "time_h": [zt["time_h"].values[i] for i in range(n_t)],
+                        "member": list(range(n_t)),
+                    },
+                })
 
-        # Map
-        fig_lz, ax_lz = plt.subplots(1, 1, figsize=(10, 8),
-                                     subplot_kw={"projection": projection})
-        ax_lz.coastlines(resolution="50m", alpha=0.6)
-        ax_lz.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.3)
-        ax_lz.add_feature(cfeature.BORDERS.with_scale("50m"), alpha=0.2)
-        ax_lz.add_feature(cfeature.LAND, facecolor="lightyellow", alpha=0.3)
-        cf2 = ax_lz.contourf(lons, lats, frac, levels=np.linspace(0, 1, 11),
-                              cmap=cmc.batlow_r, transform=ccrs.PlateCarree(),
-                              alpha=0.65)
-        fig_lz.colorbar(cf2, ax=ax_lz, orientation="vertical",
-                        pad=0.02, shrink=0.85).set_label("Fraction reachable", fontsize=9)
-
-        for z_idx, zd in enumerate(zone_traj_data):
-            color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
-            for i in range(zd["lat"].shape[0]):
-                ax_lz.plot(zd["lon"][i], zd["lat"][i], "-", color=color,
-                           alpha=0.35, linewidth=0.8, transform=ccrs.PlateCarree())
-            _plot_geodesic_circle(ax_lz, zd["centroid_lat"], zd["centroid_lon"],
-                                  200.0, color=color)
-            ax_lz.scatter([zd["centroid_lon"]], [zd["centroid_lat"]],
-                          color=color, marker="*", s=200, zorder=9,
-                          transform=ccrs.PlateCarree(),
-                          label=(f"Zone {z_idx}  n={zd['n_traj']}  "
-                                 f"frac={zd['mean_frac']:.2f}"))
-
-        ax_lz.scatter([start_lon], [start_lat], color="black", marker="o",
-                      s=80, zorder=10, transform=ccrs.PlateCarree(), label="Origin")
-        ax_lz.set_extent([float(lons.min()), float(lons.max()),
-                          float(lats.min()), float(lats.max())],
-                         crs=ccrs.PlateCarree())
-        ax_lz.legend(loc="lower left", fontsize=8)
-        gl2 = ax_lz.gridlines(draw_labels=True, dms=True, x_inline=False,
-                               y_inline=False, linewidth=0.5, color="black",
-                               alpha=0.5, linestyle=(0, (15, 10)))
-        gl2.top_labels = False; gl2.right_labels = False
-        ax_lz.set_title("Suggested landing zones with matching trajectories",
-                        fontsize=11)
-        fig_lz.tight_layout()
-        figures["landing_zones_map"] = fig_lz
-
-        # Pressure profiles per zone
-        fig_lzp, axes_lzp = plt.subplots(
-            1, max(n_zones, 1), figsize=(4 * max(n_zones, 1), 4), sharey=True
-        )
-        if n_zones == 1:
-            axes_lzp = [axes_lzp]
-        for z_idx, zd in enumerate(zone_traj_data):
-            color = _ZONE_COLORS[z_idx % len(_ZONE_COLORS)]
-            ax_p  = axes_lzp[z_idx]
-            for i in range(zd["time_h"].shape[0]):
-                t = zd["time_h"][i]; p = zd["plev"][i]
-                ok = np.isfinite(t) & np.isfinite(p)
-                ax_p.plot(t[ok], p[ok], "-", color=color,
-                          alpha=0.4, linewidth=0.8)
-            ax_p.set_title(f"Zone {z_idx}\n({zd['n_traj']} traj)", fontsize=9)
-            ax_p.set_xlabel("Time after start (h)")
-            if z_idx == 0:
-                ax_p.set_ylabel("Pressure (hPa)")
-            ax_p.invert_yaxis()
-        fig_lzp.suptitle("Pressure profiles by landing zone", fontsize=11)
-        fig_lzp.tight_layout()
-        figures["landing_zones_profiles"] = fig_lzp
+        if zones_for_plot:
+            figures["landing_zones_map"]      = _make_lz_map(
+                zones_for_plot, lons, lats, frac, start_lat, start_lon
+            )
+            figures["landing_zones_profiles"] = _make_lz_profiles(zones_for_plot)
 
         ds_lz.close()
 

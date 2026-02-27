@@ -119,7 +119,93 @@ Return values (for `k_best == 1`):
 
 ---
 
-## 3. Notebooks
+## 3. Full Pipeline (`run_pipeline.py`)
+
+`run_pipeline.py` is the end-to-end orchestrator.  It reads `params.txt`,
+computes transitions for every ensemble member, runs the optimizer in parallel,
+and writes all outputs to a time-stamped directory.
+
+### Running the pipeline
+
+```bash
+python run_pipeline.py [params.txt]
+```
+
+If no path is given, the script expects `params.txt` next to itself.
+
+### Output directory structure
+
+```
+<base_dir>/<source>_<label>_<start>_<end>_<timestamp>/
+│
+├── params.txt                   # copy of the config used
+├── pipeline.log                 # full run log
+│
+├── transitions/
+│   └── transition_indices_*.nc  # one file per member
+│
+├── member_<id>/                 # one sub-directory per ensemble member
+│   ├── trajectories.nc          # top-k trajectories (lat, lon, plev, time_h, …)
+│   ├── reachable_mask.nc        # 2-D boolean reachability mask
+│   ├── reachable_map.png        # map plot saved by the pipeline
+│   └── pressure_profiles.png
+│
+└── probabilistic/
+    ├── probabilistic.nc             # ensemble-fraction field + per-member ranges
+    ├── prob_reachable_map.png       # ensemble fraction map
+    ├── max_range_histogram.png
+    ├── landing_zones.nc             # zone metadata (centroid, score, …)
+    ├── landing_zones_map.png
+    ├── landing_zones_pressure_profiles.png
+    └── landing_zone_<n>_trajectories.nc   # per-zone trajectory set
+```
+
+### Key `params.txt` settings
+
+| Section | Key | Description |
+|---------|-----|-------------|
+| `[data]` | `source` | `era5` or `ifs` |
+| `[data]` | `n_members` | Number of IFS members to process |
+| `[origin]` | `start_lat`, `start_lon` | Launch site (°N, °E) |
+| `[time]` | `start`, `end` | ISO-8601 range consumed by transition computation |
+| `[optimizer]` | `budget` | Vertical-cost budget |
+| `[optimizer]` | `k_best` | Top-k trajectories to store per member |
+| `[optimizer]` | `land_only` | Restrict endpoints to land cells |
+| `[output]` | `base_dir` | Root directory for run output |
+
+### Public plotting API
+
+When working in a notebook you can import `run_pipeline` and call any of the
+following functions against an **existing** output directory without re-running
+the pipeline:
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `plot_member_from_nc(member_dir, member, start_lat, start_lon)` | `(fig_map, fig_pres)` | Map + pressure profiles for a single member |
+| `plot_member_by_target(member_dir, member, target_lat, target_lon, radius_km)` | `fig` or `None` | Profiles of trajectories ending near a target |
+| `plot_probabilistic_from_nc(run_dir, members, start_lat, start_lon)` | `dict[str, Figure]` | Fraction map, histogram, landing-zone plots |
+
+See `inspect_pipeline_output.ipynb` for ready-to-run examples.
+
+### Private map/plot helpers
+
+All map rendering logic is centralised in private helpers shared by both the
+pipeline save functions and the notebook plot functions:
+
+- `_make_map_axes(center_lon, center_lat, figsize)` – creates a RotatedPole
+  figure with coastlines, ocean, land and borders.
+- `_set_map_extent(ax, lons, lats, padding)` – sets the visible domain.
+- `_add_gridlines(ax)` – adds labelled gridlines with standard style.
+- `_plot_frac_contourf(ax, fig, lons, lats, frac, ...)` – draws the filled
+  fraction contour with colour bar; masks zero-fraction cells by default.
+- `_make_histogram_fig(dist_m)` – returns a max-range histogram figure.
+- `_make_lz_map(zones, lons, lats, frac, start_lat, start_lon)` – landing-zones
+  overview map figure.
+- `_make_lz_profiles(zones)` – per-zone pressure-profile figure.
+
+---
+
+## 4. Notebooks
 
 Two main notebooks demonstrate and debug the workflow:
 
@@ -156,9 +242,22 @@ Useful for verifying:
     farthest endpoint distance.
   - Pressure profile of the farthest trajectory.
 
+### `inspect_pipeline_output.ipynb`
+
+Interactive inspection notebook for a completed pipeline run.  Import
+`run_pipeline as rp` and point `RUN_DIR` at an output directory to:
+
+- Print the xarray dataset structure of `probabilistic.nc`.
+- Display per-member trajectory maps and pressure profiles.
+- Plot trajectories ending near a custom target point.
+- Reproduce the ensemble-fraction map, max-range histogram, and
+  landing-zone figures using `rp.plot_probabilistic_from_nc`.
+
+All plots are produced from the saved NetCDF files with no re-computation.
+
 ---
 
-## 4. Dependencies
+## 5. Dependencies
 
 Key Python packages:
 
@@ -181,35 +280,35 @@ pip install numpy xarray matplotlib cartopy shapely tqdm pyproj
 
 ---
 
-## 5. Typical workflow
+## 6. Typical workflow
 
 1. **Generate transition matrices**
 
-   - Edit paths and date range in `compute_transition.py` to point to your ERA5 data.
-   - Run the script to produce a netCDF file with `lat_idx` and `lon_idx`.
+   - Configure `params.txt` (data source, domain, time range, origin).
+   - Either let the pipeline compute them automatically (step 3) or run
+     `compute_transition.py` directly.
 
-2. **Inspect transitions**
+2. **Inspect transitions (optional)**
 
-   - Open `test_transition.ipynb`.
-   - Run cells to:
-     - Plot the domain.
-     - Recompute a single-step transition matrix.
-     - Inspect index-space and map-space arrows.
-     - Check self-pointers and topography masking.
+   - Open `test_transition.ipynb` and run all cells.
 
-3. **Optimize trajectories**
+3. **Run the pipeline**
 
-   - Open `test_graph_optimizer.ipynb`.
-   - Point `TRANSITION_FILE` to your transition file.
-   - Set `START_LAT/LON` and `TARGET_LAT/LON`.
-   - Run cells to:
-     - Compute top-k point-to-point paths.
-     - Compute the farthest bottom-level land-reachable trajectory.
-     - Visualize trajectories, reachable region, and range circle.
+   ```bash
+   python run_pipeline.py params.txt
+   ```
+
+   This creates a time-stamped directory under `output.base_dir` containing
+   all NetCDF files and PNG diagnostics.
+
+4. **Inspect results in the notebook**
+
+   - Open `inspect_pipeline_output.ipynb`, set `RUN_DIR` to the output
+     directory, and run all cells to browse every diagnostic figure.
 
 ---
 
-## 6. Notes
+## 7. Notes
 
 - The vertical cost and allowed levels are configurable; current defaults
   use `abs(l_new - l_prev)` as cost and allow adjacent-level moves only.
