@@ -1,0 +1,114 @@
+# ============================================================
+# Balloon Optimizer Pipeline Configuration
+# ============================================================
+# Initial example matching the 2024-09-14 IFS case from the notebook.
+# Copy this file to your output directory or keep it here as a template.
+# ============================================================
+
+[run]
+# Human-readable label appended to the output folder name.
+label = ensemble_test
+
+# Number of parallel workers used for the optimization phase.
+# Time-step DP is CPU-bound; 16 is a good default for the cluster nodes.
+n_opt_workers = 16
+
+
+# ============================================================
+[data]
+# ============================================================
+# Which NWP data source to use.
+#   era5  – hourly ERA5 P-files under data_root
+#   ifs   – 6-hourly IFS ensemble P-files under ifs_root
+source = ifs
+
+# Root directory for ERA5 P-files (used when source=era5).
+# Expected layout: <data_root>/<YYYY>/<MM>/P<YYYYMMDD_HH>
+era5_root = /home/kbrennan/data/era5/cdf
+
+# Root directory for IFS P-files (used when source=ifs).
+# Expected layout: <ifs_root>/<ifs_init>/<member>/P<YYYYMMDD_HH>
+ifs_root = /net/tropo/atmosdyn/eps/ncdf
+
+# IFS initialisation time (required when source=ifs).
+ifs_init = 20260222_12
+
+# Number of ensemble members to process.
+# The pipeline scans the data directory and picks the first n_members
+# available member folders (sorted alphabetically).
+# For ERA5 set this to 1.
+n_members = 50
+
+# Pre-existing transition-matrix directory.  If set, the pipeline skips
+# recomputation and looks for files matching the expected naming scheme here.
+# Leave blank to always (re)compute.
+transition_dir =
+
+
+# ============================================================
+[time]
+# ============================================================
+# Forecast / reanalysis window used to build transition matrices.
+# Format: YYYYMMDD_HH (UTC).
+start = 20260222_12
+end   = 20260224_12
+
+# Advection time step in seconds (currently only 3600 s is well-tested).
+dt = 3600
+
+# Horizontal superscaling factor for the transition computation.
+# 1 = native grid, 3 = 3× finer intermediate grid (recommended).
+superscale = 3
+
+
+# ============================================================
+[domain]
+# ============================================================
+# Geographic domain over which to compute transitions (degrees).
+lon_min = -22.0
+lon_max =  38.0
+lat_min =  30.0
+lat_max =  75.0
+
+
+# ============================================================
+[origin]
+# ============================================================
+# Launch site coordinates (decimal degrees, WGS84).
+start_lat = 51.963517
+start_lon =  7.615650
+
+
+# ============================================================
+[optimizer]
+# ============================================================
+# Total consumable budget B (number of level changes allowed).
+budget = 13.0
+
+# Number of top trajectories to return per ensemble member.
+k_best = 30
+
+# If true, only land gridpoints are considered as valid terminal endpoints.
+land_only = true
+
+# Optional: penalty for spending budget early in the flight.
+# 0.0 disables the shaping; ~1000 m is a good default.
+early_cost_penalty = 1000.0
+
+
+# ============================================================
+[pressure_levels]
+# ============================================================
+# Comma-separated target pressure levels in hPa.
+levels = 1000,950,900,850,800,750,700,650,600,550,500
+
+# Pressure level used as the "surface" (start and end) level (hPa).
+# Must appear in the levels list above.
+surface_level_hpa = 1000
+
+
+# ============================================================
+[output]
+# ============================================================
+# Base directory; a timestamped sub-folder is created for each run.
+base_dir = /net/litho/atmosdyn2/kbrennan/data/balloon/solutions

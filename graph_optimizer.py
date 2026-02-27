@@ -369,6 +369,7 @@ def find_farthest_reachable(
     lons: Optional[np.ndarray] = None,
     k_best: int = 1,
     early_cost_penalty: float = 1_000.0,
+    show_progress: bool = True,
 ) -> Tuple[bool, Optional[object], Optional[object], Optional[object]]:
     """Find farthest reachable points from the origin under a consumable budget.
 
@@ -522,7 +523,7 @@ def find_farthest_reachable(
     else:
         geod = None
 
-    for k in tqdm(range(k_start, k_end), desc="Searching farthest reachable points"):
+    for k in tqdm(range(k_start, k_end), desc="Searching farthest reachable points", disable=not show_progress):
         best_value_next = np.full((Nx, Ny, Nz), -np.inf, dtype=float)
         best_cost_next = np.full((Nx, Ny, Nz), np.inf, dtype=float)
 

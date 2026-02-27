@@ -333,9 +333,8 @@ def main(
         )
         # Round end up to next 6h boundary
         if t_end.hour % 6 != 0:
-            t_last = t_end.replace(
-                hour=((t_end.hour // 6) + 1) * 6, minute=0, second=0,
-            )
+            hours_to_next = 6 - (t_end.hour % 6)
+            t_last = t_end.replace(minute=0, second=0, microsecond=0) + timedelta(hours=hours_to_next)
         else:
             t_last = t_end
 
